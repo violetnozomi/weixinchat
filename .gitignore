@@ -1,0 +1,35 @@
+# 忽略编译和生成目录（绝对不能提交！）
+build/
+bin/
+out/
+
+# 忽略 IDE 的本地私人配置
+.idea/
+.vscode/
+*.user
+*.pro.user
+
+# 忽略 C++ 产生的中间文件和可执行程序
+*.obj
+*.o
+*.exe
+*.dll
+*.pdb
+*.ilk
+Makefile*
+# =========================
+# CMake 专属忽略规则
+# =========================
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CMakeScripts/
+Testing/
+Makefile
+*.cmake
+compile_commands.json
+
+# 如果你使用的是 Ninja 构建器
+.ninja_deps
+.ninja_log
+build.ninja

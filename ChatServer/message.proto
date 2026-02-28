@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package message;
+
+service VarifyService {
+  rpc GetVarifyCode (GetVarifyReq) returns (GetVarifyRsp) {}
+}
+
+message GetVarifyReq {
+  string email = 1;
+}
+
+message GetVarifyRsp {
+  int32 error = 1;
+  string email = 2;
+  string code = 3;
+}
+message GetChatServerReq {
+  int32 uid = 1;
+}
+
+message GetChatServerRsp {
+  int32 error = 1;
+  string host = 2;
+  string port = 3;
+  string token = 4;
+}
+
+// 登录验证请求
+message LoginVerifyReq {
+  string token = 1;
+  int32 uid = 2;
+}
+
+// 登录验证响应
+message LoginVerifyRsp {
+  int32 error = 1;
+  string msg = 2;
+  int32 uid = 3;
+  string user = 4;
+}
+
+// 查询某 uid 当前所在的 ChatServer（gRPC 地址）
+message GetUserServerReq {
+  int32 uid = 1;
+}
+
+message GetUserServerRsp {
+  int32 error    = 1;
+  string host    = 2;
+  string grpc_port = 3;
+}
+
+// 跨 ChatServer 添加好友通知
+message DeliverAddFriendReq {
+  int32  from_uid   = 1;
+  string from_name  = 2;
+  int32  to_uid     = 3;
+  string message    = 4;
+}
+
+message DeliverAddFriendRsp {
+  int32  error = 1;
+  string msg   = 2;
+}
+message DeliverSignalingReq {
+  int32 from_uid = 1;
+  int32 to_uid = 2;
+  string type = 3;    // "webrtc_offer", "webrtc_answer", "webrtc_ice"
+  string payload = 4; // SDP 或 Candidate 字符串
+}
+
+message DeliverSignalingRsp {
+  int32 error = 1;
+}
+service StatusService {
+  rpc GetChatServer  (GetChatServerReq)  returns (GetChatServerRsp)  {}
+  rpc LoginVerify    (LoginVerifyReq)    returns (LoginVerifyRsp)    {}
+  rpc GetUserServer  (GetUserServerReq)  returns (GetUserServerRsp)  {}
+}
+
+// ChatServer 间互调服务
+service ChatService {
+  rpc DeliverAddFriend (DeliverAddFriendReq) returns (DeliverAddFriendRsp) {}
+  rpc DeliverWebRTCSignaling(DeliverSignalingReq) returns (DeliverSignalingRsp){}
+}
