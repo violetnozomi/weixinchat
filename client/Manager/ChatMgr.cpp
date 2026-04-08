@@ -1,104 +1,195 @@
 #include "ChatMgr.h"
+
 #include "ChatStorage.h"
-#include <algorithm>
 
 ChatMgr::ChatMgr() = default;
-
-// ── 初始化 ──────────────────────────────────────────────────────────────────────
 
 void ChatMgr::Init(int selfUid)
 {
     ChatStorage::GetInstance()->Init(selfUid);
+    _histories.clear();
+    _unread.clear();
+    _active_conversation_key.clear();
     _db_loaded.clear();
 }
-// ── SQLite 惰性加载 ─────────────────────────────────────────────────────────────────────
 
-void ChatMgr::EnsureLoaded(int peerUid)
+void ChatMgr::EnsureLoaded(const QString &conversationKey)
 {
-    if (_db_loaded.contains(peerUid)) return;
-    _db_loaded.insert(peerUid);
+    if (_db_loaded.contains(conversationKey)) {
+        return;
+    }
 
-    auto rows = ChatStorage::GetInstance()->LoadHistory(peerUid);
+    _db_loaded.insert(conversationKey);
+    const auto rows = ChatStorage::GetInstance()->LoadHistory(conversationKey);
     if (!rows.isEmpty()) {
-        _histories[peerUid] = rows;
+        _histories[conversationKey] = rows;
     }
 }
-// ── 追加消息 ─────────────────────────────────────────────────────────────────
 
-void ChatMgr::AppendMessage(const MessageInfo &msg)
+bool ChatMgr::AppendMessage(const MessageInfo &msg)
 {
-    // 1. 确定 peerUid
-    const int peerUid = msg.isSelf ? msg.toUid : msg.fromUid;
+    MessageInfo stored = msg;
+    if (stored.conversationKey.isEmpty()) {
+        if (stored.conversationType == ConversationType::Group || !stored.groupId.isEmpty()) {
+            stored.conversationType = ConversationType::Group;
+            stored.conversationKey = MakeGroupConversationKey(stored.groupId);
+        } else {
+            stored.conversationType = ConversationType::Peer;
+            const int peerUid = stored.isSelf ? stored.toUid : stored.fromUid;
+            stored.conversationKey = MakePeerConversationKey(peerUid);
+        }
+    } else if (IsGroupConversationKey(stored.conversationKey)) {
+        stored.conversationType = ConversationType::Group;
+        if (stored.groupId.isEmpty()) {
+            stored.groupId = ExtractGroupIdFromConversationKey(stored.conversationKey);
+        }
+    } else {
+        stored.conversationType = ConversationType::Peer;
+    }
 
-    // 2. 持久化到 SQLite
-    ChatStorage::GetInstance()->SaveMessage(msg);
+    if (!IsValidConversationKey(stored.conversationKey)) {
+        qWarning() << "[ChatMgr] Ignore invalid conversation key:" << stored.conversationKey
+                   << "from_uid=" << stored.fromUid << "to_uid=" << stored.toUid
+                   << "is_self=" << stored.isSelf;
+        return false;
+    }
 
-    // 3. 内存中更新
+    if (!stored.msgId.isEmpty()) {
+        EnsureLoaded(stored.conversationKey);
+        const auto it = _histories.find(stored.conversationKey);
+        if (it != _histories.end()) {
+            for (const auto &existing : it.value()) {
+                if (existing.msgId == stored.msgId) {
+                    return false;
+                }
+            }
+        }
+    }
 
-    _histories[peerUid].append(msg);
+    ChatStorage::GetInstance()->SaveMessage(stored);
+    _histories[stored.conversationKey].append(stored);
 
-    // 仅当该会话不是当前活动会话时才增加未读数
-    if (peerUid != _active_peer_uid && !msg.isSelf) {
-        _unread[peerUid]++;
-        emit sig_unread_changed(peerUid, _unread[peerUid]);
+    if (stored.conversationKey != _active_conversation_key && !stored.isSelf) {
+        _unread[stored.conversationKey]++;
+        emit sig_unread_changed(stored.conversationKey, _unread[stored.conversationKey]);
         emit sig_total_unread_changed(TotalUnread());
     }
 
-    emit sig_message_appended(peerUid, msg);
+    emit sig_message_appended(stored.conversationKey, stored);
+    return true;
 }
 
-// ── 历史记录获取 ──────────────────────────────────────────────────────────────
-
-const QVector<MessageInfo> &ChatMgr::GetHistory(int peerUid)
+bool ChatMgr::UpdatePendingGroupTextAck(const QString &conversationKey,
+                                        const QString &serverMsgId,
+                                        const QDateTime &serverTime)
 {
-    EnsureLoaded(peerUid);
-    auto it = _histories.find(peerUid);
-    if (it == _histories.end()) return _empty_vec;
+    if (conversationKey.isEmpty() || serverMsgId.isEmpty()) {
+        return false;
+    }
+
+    EnsureLoaded(conversationKey);
+    if (!ChatStorage::GetInstance()->UpdatePendingGroupTextAck(
+            conversationKey, serverMsgId, serverTime)) {
+        return false;
+    }
+
+    auto it = _histories.find(conversationKey);
+    if (it == _histories.end()) {
+        return true;
+    }
+
+    for (MessageInfo &msg : it.value()) {
+        if (msg.conversationType != ConversationType::Group ||
+            !msg.isSelf ||
+            msg.type != MessageInfo::Text ||
+            !msg.msgId.isEmpty()) {
+            continue;
+        }
+
+        msg.msgId = serverMsgId;
+        if (serverTime.isValid()) {
+            msg.time = serverTime;
+        }
+        return true;
+    }
+
+    return true;
+}
+
+const QVector<MessageInfo> &ChatMgr::GetHistory(const QString &conversationKey)
+{
+    EnsureLoaded(conversationKey);
+    const auto it = _histories.find(conversationKey);
+    if (it == _histories.end()) {
+        return _empty_vec;
+    }
     return it.value();
 }
 
-MessageInfo ChatMgr::GetLastMessage(int peerUid) const
+MessageInfo ChatMgr::GetLastMessage(const QString &conversationKey)
 {
-    auto it = _histories.find(peerUid);
-    if (it == _histories.end() || it.value().isEmpty()) return MessageInfo{};
+    EnsureLoaded(conversationKey);
+    const auto it = _histories.find(conversationKey);
+    if (it == _histories.end() || it.value().isEmpty()) {
+        return MessageInfo{};
+    }
     return it.value().last();
 }
 
-QList<int> ChatMgr::GetConversationList() const
+QList<QString> ChatMgr::GetConversationList()
 {
-    QList<int> keys = _histories.keys();
-    // 按最后一条消息的时间倒序排列（最近的排在最前面）
-    std::sort(keys.begin(), keys.end(), [this](int a, int b) {
-        return GetLastMessage(a).time > GetLastMessage(b).time;
-    });
+    QList<QString> keys = ChatStorage::GetInstance()->GetConversationKeys();
+    for (auto it = _histories.begin(); it != _histories.end(); ++it) {
+        if (!IsValidConversationKey(it.key())) {
+            continue;
+        }
+        if (!keys.contains(it.key())) {
+            keys.append(it.key());
+        }
+    }
     return keys;
 }
 
-// ── 未读计数 ─────────────────────────────────────────────────────────────────
+QString ChatMgr::GetLatestServerMsgId(const QString &conversationKey)
+{
+    EnsureLoaded(conversationKey);
+    const auto it = _histories.find(conversationKey);
+    if (it != _histories.end()) {
+        const auto &history = it.value();
+        for (int i = history.size() - 1; i >= 0; --i) {
+            if (!history[i].msgId.isEmpty()) {
+                return history[i].msgId;
+            }
+        }
+    }
+    return ChatStorage::GetInstance()->GetLatestServerMsgId(conversationKey);
+}
 
 int ChatMgr::TotalUnread() const
 {
     int total = 0;
-    for (auto count : _unread)
+    for (auto count : _unread) {
         total += count;
+    }
     return total;
 }
 
-void ChatMgr::MarkAsRead(int peerUid)
+void ChatMgr::MarkAsRead(const QString &conversationKey)
 {
-    if (_unread.value(peerUid, 0) == 0) return;
-    _unread[peerUid] = 0;
-    emit sig_unread_changed(peerUid, 0);
+    if (_unread.value(conversationKey, 0) == 0) {
+        return;
+    }
+
+    _unread[conversationKey] = 0;
+    emit sig_unread_changed(conversationKey, 0);
     emit sig_total_unread_changed(TotalUnread());
 }
-
-// ── 清理 ─────────────────────────────────────────────────────────────────────
 
 void ChatMgr::Clear()
 {
     _histories.clear();
     _unread.clear();
-    _active_peer_uid = -1;
+    _active_conversation_key.clear();
     _db_loaded.clear();
     ChatStorage::GetInstance()->Close();
 }

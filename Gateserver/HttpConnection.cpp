@@ -20,7 +20,7 @@ void HttpConnection::start() {
                 return;
             }
             self->HandleRequest();
-            self->Cheakdeadline();
+            self->CheckDeadline();
         }catch (std::exception &e) {
             std::cerr << e.what() << '\n';
         }
@@ -29,6 +29,15 @@ void HttpConnection::start() {
 void HttpConnection::HandleRequest() {
     _response.version(_request.version());
     _response.keep_alive(false);
+    // CORS headers
+    _response.set(http::field::access_control_allow_origin, "*");
+    _response.set(http::field::access_control_allow_methods, "GET, POST, OPTIONS");
+    _response.set(http::field::access_control_allow_headers, "Content-Type");
+    if (_request.method() == http::verb::options) {
+        _response.result(http::status::no_content);
+        WriteResponse();
+        return;
+    }
     if (_request.method() == http::verb::post) {
     bool success = LogicSystem::GetInstance()->HandlePost(_request.target(),shared_from_this());
         if (!success) {
@@ -70,7 +79,7 @@ void HttpConnection::WriteResponse() {
         self->_deadline.cancel();
     });
 }
-void HttpConnection::Cheakdeadline() {
+void HttpConnection::CheckDeadline() {
     auto self = shared_from_this();
     _deadline.async_wait([self](beast::error_code ec) {
         if (!ec) {
@@ -89,7 +98,7 @@ unsigned char HttpConnection:: FromHex(unsigned char x)
     if (x >= 'A' && x <= 'Z') y = x - 'A' + 10;
     else if (x >= 'a' && x <= 'z') y = x - 'a' + 10;
     else if (x >= '0' && x <= '9') y = x - '0';
-    else assert(0);
+    else y = 0; // 非法hex字符，安全降级返回0
     return y;
 }
 std::string HttpConnection::UrlEncode(const std::string& str)
@@ -128,7 +137,10 @@ std::string HttpConnection::UrlDecode(const std::string& str)
         //遇到%将后面的两个字符从16进制转为char再拼接
         else if (str[i] == '%')
         {
-            assert(i + 2 < length);
+            if (i + 2 >= length) {
+                // 畸形 URL 编码，跳过不完整的 % 序列
+                break;
+            }
             unsigned char high = FromHex((unsigned char)str[++i]);
             unsigned char low = FromHex((unsigned char)str[++i]);
             strTemp += high * 16 + low;

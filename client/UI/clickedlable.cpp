@@ -4,6 +4,15 @@ ClickedLable::ClickedLable(QWidget *parent):QLabel(parent),_curstate(ClickLbStat
     this->setCursor(Qt::PointingHandCursor);
 }
 void ClickedLable::mousePressEvent(QMouseEvent* event){
+    if (event->button() == Qt::LeftButton) {
+        if(_curstate == ClickLbState::Normal){
+            setProperty("state", _normal_press);
+        }else{
+            setProperty("state", _selected_press);
+        }
+        repolish(this);
+        update();
+    }
 
     QLabel::mousePressEvent(event);
 }

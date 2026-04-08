@@ -17,8 +17,8 @@ class LogicSystem:public Singleton<LogicSystem>{
     ~LogicSystem(){};
     bool HandleGet(std::string ,std::shared_ptr<HttpConnection>);
     bool HandlePost(std::string ,std::shared_ptr<HttpConnection>);
-    void RegGet(std:: string url ,HttpHandler);
-    void RePost(std:: string url ,HttpHandler);
+    void RegGet(std::string url, HttpHandler);
+    void RegPost(std::string url, HttpHandler);
 private:
     LogicSystem();
     std::map<std:: string,HttpHandler> _get_handler;

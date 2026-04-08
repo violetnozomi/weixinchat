@@ -11,7 +11,34 @@ const PROTO_PATH = path.join(__dirname, 'message.proto');
 async function GetVarifyCode(call, callback) {
     console.log("email is ", call.request.email)
     try{
-        let query_res = await redis_module.GetRedis(const_module.code_prefix+call.request.email);
+        // 邮箱格式校验
+        const email = (call.request.email || '').trim();
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (!emailRegex.test(email)) {
+            callback(null, { email: email,
+                error: const_module.Errors.Exception
+            });
+            return;
+        }
+
+        // 速率限制：每个邮箱每10分钟最多5次
+        const rateLimitKey = 'rate_limit:' + email;
+        let reqCount = await redis_module.GetRedis(rateLimitKey);
+        if (reqCount !== null && parseInt(reqCount) >= 5) {
+            console.log("Rate limited for email: ", email);
+            callback(null, { email: email,
+                error: const_module.Errors.Exception
+            });
+            return;
+        }
+        // 增加计数
+        if (reqCount === null) {
+            await redis_module.SetRedisExpire(rateLimitKey, '1', 600);
+        } else {
+            await redis_module.SetRedisExpire(rateLimitKey, String(parseInt(reqCount) + 1), 600);
+        }
+
+        let query_res = await redis_module.GetRedis(const_module.code_prefix+email);
         console.log("query_res is ", query_res)
         if(query_res == null){
 
@@ -22,9 +49,9 @@ async function GetVarifyCode(call, callback) {
             if (uniqueId.length > 4) {
                 uniqueId = uniqueId.substring(0, 4);
             } 
-            let bres = await redis_module.SetRedisExpire(const_module.code_prefix+call.request.email, uniqueId,600)
+            let bres = await redis_module.SetRedisExpire(const_module.code_prefix+email, uniqueId,600)
             if(!bres){
-                callback(null, { email:  call.request.email,
+                callback(null, { email:  email,
                     error:const_module.Errors.RedisErr
                 });
                 return;
@@ -36,7 +63,7 @@ async function GetVarifyCode(call, callback) {
         //发送邮件
         let mailOptions = {
             from: config_module.email_user,
-            to: call.request.email,
+            to: email,
             subject: '验证码',
             text: text_str,
         };
@@ -44,7 +71,7 @@ async function GetVarifyCode(call, callback) {
         let send_res = await emailModule.SendMail(mailOptions);
         console.log("send res is ", send_res)
 
-        callback(null, { email:  call.request.email,
+        callback(null, { email:  email,
             error:const_module.Errors.Success
         }); 
 
@@ -52,7 +79,7 @@ async function GetVarifyCode(call, callback) {
     }catch(error){
         console.log("catch error is ", error)
 
-        callback(null, { email:  call.request.email,
+        callback(null, { email:  (call.request.email || ''),
             error:const_module.Errors.Exception
         }); 
     }

@@ -1,0 +1,2 @@
+chatdialog.cpp
+D:\Qt\6.10.2\msvc2022_64\include\QtCore/qcompilerdetection.h(1319): fatal error C1189: #error:  "Qt requires a C++17 compiler, and a suitable value for __cplusplus. On MSVC, you must pass the /Zc:__cplusplus option to the compiler."

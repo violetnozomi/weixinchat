@@ -31,14 +31,15 @@ void ServerRun() {
     signals.async_wait([&server](boost::system::error_code ec, int signal_num) {
         if (!ec) {
             std::cout << "Shutting down server..." << std::endl;
-           server->Shutdown(); // 优雅地关闭服务器
+           server->Shutdown();
         }
     });
-    std::thread([&ioc]() {
+    std::thread signal_thread([&ioc]() {
            ioc.run();
-       }).detach();
+       });
     server->Wait();
     ioc.stop();
+    if (signal_thread.joinable()) signal_thread.join();
 }
 int main() {
     try {

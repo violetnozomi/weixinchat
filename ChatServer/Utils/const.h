@@ -1,0 +1,109 @@
+#ifndef CHATSERVER_CONST_H
+#define CHATSERVER_CONST_H
+
+#include <iostream>
+#include <json/json.h>
+#include <memory>
+#include <mutex>
+#include <queue>
+#include <string>
+#include <unordered_map>
+
+enum MSG_ID {
+    // TCP chat messages (2000-2999)
+    ID_CHAT_LOGIN_REQ = 2001,
+    ID_CHAT_LOGIN_RSP = 2002,
+    ID_TEXT_CHAT_MSG = 2003,
+    ID_TEXT_CHAT_MSG_RSP = 2004,
+    ID_SEARCH_USER_REQ = 2005,
+    ID_SEARCH_USER_RSP = 2006,
+    ID_ADD_FRIEND_REQ = 2007,
+    ID_ADD_FRIEND_RSP = 2008,
+    ID_NOTIFY_ADD_FRIEND = 2009,
+    ID_ACCEPT_FRIEND_REQ = 2010,
+    ID_ACCEPT_FRIEND_RSP = 2011,
+    ID_NOTIFY_ACCEPT_FRIEND = 2012,
+    ID_FRIENDS_LIST_RSP = 2013,
+
+    ID_DELETE_FRIEND_REQ = 2023,
+    ID_DELETE_FRIEND_RSP = 2024,
+    ID_BLOCK_FRIEND_REQ = 2025,
+    ID_BLOCK_FRIEND_RSP = 2026,
+    ID_UPDATE_PROFILE_REQ = 2027,
+    ID_UPDATE_PROFILE_RSP = 2028,
+    ID_AI_CHAT_MSG = 2029,
+
+    // MinIO object storage transfer (2030-2043)
+    ID_FILE_MINIO_INIT_REQ = 2030,
+    ID_FILE_MINIO_INIT_RSP = 2031,
+    ID_FILE_MINIO_COMMIT = 2032,
+    ID_FILE_MINIO_COMMIT_RSP = 2033,
+    ID_FILE_MINIO_NOTIFY = 2034,
+    ID_FILE_MINIO_REFRESH_REQ = 2035,
+    ID_FILE_MINIO_REFRESH_RSP = 2036,
+    ID_FILE_MINIO_MP_INIT_REQ = 2037,
+    ID_FILE_MINIO_MP_INIT_RSP = 2038,
+    ID_FILE_MINIO_MP_COMPLETE_REQ = 2039,
+    ID_FILE_MINIO_MP_COMPLETE_RSP = 2040,
+    ID_FILE_MINIO_MP_RESUME_REQ = 2041,
+    ID_FILE_MINIO_MP_RESUME_RSP = 2042,
+    ID_FILE_MINIO_MP_ABORT_REQ = 2043,
+
+    // Timeline sync
+    ID_SYNC_MSG_REQ = 2050,
+    ID_SYNC_MSG_RSP = 2051,
+
+    // Group chat
+    ID_CREATE_GROUP_REQ = 2060,
+    ID_CREATE_GROUP_RSP = 2061,
+    ID_GROUP_INFO_REQ = 2062,
+    ID_GROUP_INFO_RSP = 2063,
+    ID_GROUP_MEMBER_LIST_REQ = 2064,
+    ID_GROUP_MEMBER_LIST_RSP = 2065,
+    ID_INVITE_GROUP_MEMBER_REQ = 2066,
+    ID_INVITE_GROUP_MEMBER_RSP = 2067,
+    ID_QUIT_GROUP_REQ = 2068,
+    ID_QUIT_GROUP_RSP = 2069,
+    ID_GROUP_TEXT_MSG = 2070,
+    ID_GROUP_TEXT_MSG_RSP = 2071,
+    ID_GROUP_SYNC_REQ = 2072,
+    ID_GROUP_SYNC_RSP = 2073,
+    ID_GROUP_EVENT_NOTIFY = 2074,
+
+    // Group admin operations
+    ID_DISSOLVE_GROUP_REQ = 2076,
+    ID_DISSOLVE_GROUP_RSP = 2077,
+    ID_TRANSFER_OWNER_REQ = 2078,
+    ID_TRANSFER_OWNER_RSP = 2079,
+    ID_KICK_MEMBER_REQ = 2080,
+    ID_KICK_MEMBER_RSP = 2081,
+    ID_SET_MUTE_REQ = 2082,
+    ID_SET_MUTE_RSP = 2083,
+
+    ID_HEARTBEAT = 2999,
+    ID_WEBRTC_SIGNALING = 3001,
+};
+
+enum ErrorCodes {
+    Success = 0,
+    Error_Json = 1001,
+    RPCFailed = 1002,
+    Varify_error = 1003,
+    VarifyExpired = 1004,
+    UserExist = 1005,
+    UserNotExist = 1006,
+    EmailNotMatch = 1007,
+    PasswdUpFailed = 1008,
+    PasswdInvalid = 1009,
+    UserOffline = 1010,
+    SearchNotFound = 1011,
+    TokenInvalid = 1012,
+    GroupNotFound = 1013,
+    PermissionDenied = 1014,
+    AlreadyInGroup = 1015,
+    GroupMuted = 1016,
+    NotImplementedYet = 1017,
+    InvalidRequest = 1018,
+};
+
+#endif // CHATSERVER_CONST_H

@@ -5,6 +5,85 @@
 #include <QJsonArray>
 #include <QDebug>
 #include"webrtcmgr.h"
+
+namespace {
+
+QString JsonIdToString(const QJsonValue &value)
+{
+    if (value.isString()) {
+        return value.toString();
+    }
+    if (value.isDouble()) {
+        return QString::number(static_cast<qulonglong>(value.toDouble()));
+    }
+    return QString();
+}
+
+bool IsValidUtf8(const QByteArray &data)
+{
+    const auto *bytes =
+        reinterpret_cast<const unsigned char *>(data.constData());
+    const int size = data.size();
+    int i = 0;
+    while (i < size) {
+        const unsigned char ch = bytes[i];
+        if (ch <= 0x7f) {
+            ++i;
+            continue;
+        }
+
+        int needed = 0;
+        if ((ch & 0xe0) == 0xc0) {
+            if (ch < 0xc2) {
+                return false;
+            }
+            needed = 1;
+        } else if ((ch & 0xf0) == 0xe0) {
+            needed = 2;
+        } else if ((ch & 0xf8) == 0xf0) {
+            if (ch > 0xf4) {
+                return false;
+            }
+            needed = 3;
+        } else {
+            return false;
+        }
+
+        if (i + needed >= size) {
+            return false;
+        }
+
+        for (int j = 1; j <= needed; ++j) {
+            if ((bytes[i + j] & 0xc0) != 0x80) {
+                return false;
+            }
+        }
+
+        if (needed == 2) {
+            const unsigned char b1 = bytes[i + 1];
+            if (ch == 0xe0 && b1 < 0xa0) {
+                return false;
+            }
+            if (ch == 0xed && b1 >= 0xa0) {
+                return false;
+            }
+        } else if (needed == 3) {
+            const unsigned char b1 = bytes[i + 1];
+            if (ch == 0xf0 && b1 < 0x90) {
+                return false;
+            }
+            if (ch == 0xf4 && b1 > 0x8f) {
+                return false;
+            }
+        }
+
+        i += needed + 1;
+    }
+    return true;
+}
+
+} // namespace
+
 TcpMgr::TcpMgr()
     : _pending(false)
     , _cur_msg_id(0)
@@ -43,7 +122,7 @@ TcpMgr::TcpMgr()
 TcpMgr::~TcpMgr() {
     stopHeartbeat();
     _reconnect_timer->stop();
-    _socket.close();
+    _socket.abort();  // abort 比 close 快，不会阻塞等待 pending write
 }
 
 // ── 主动断连（登出时调用）────────────────────────────────────────────────────
@@ -66,8 +145,9 @@ void TcpMgr::scheduleReconnect()
     _state = ConnectState::Reconnecting;
     _reconnect_attempt++;
 
-    // 指数退退: 2^(attempt-1) 秒，封顶在 kMaxBackoffSec
-    int delaySec = qMin(static_cast<int>(1 << _reconnect_attempt), kMaxBackoffSec);
+    // 指数退避: 2^attempt 秒，封顶在 kMaxBackoffSec
+    if (_reconnect_attempt > 30) _reconnect_attempt = 30;  // 防止移位溢出
+    int delaySec = qMin(1 << _reconnect_attempt, kMaxBackoffSec);
     qDebug() << "[TCP] Scheduling reconnect attempt" << _reconnect_attempt
              << "in" << delaySec << "seconds";
 
@@ -79,7 +159,6 @@ void TcpMgr::scheduleReconnect()
 void TcpMgr::startHeartbeat()
 {
     _heartbeat_timer->start(kHeartbeatMs);
-    qDebug() << "[TCP] Heartbeat started (every" << kHeartbeatMs / 1000 << "s)";
 }
 
 void TcpMgr::stopHeartbeat()
@@ -89,6 +168,49 @@ void TcpMgr::stopHeartbeat()
 }
 
 void TcpMgr::initHandlers() {
+    const auto dispatchChatLikePayload = [this](const QJsonObject &jsonObj,
+                                                const char *sourceTag,
+                                                const std::function<void(int, const QString&, qint64)> &plainDispatch) {
+        int from_uid = jsonObj["from_uid"].toInt();
+        if (from_uid <= 0) {
+            qWarning() << "[TCP]" << sourceTag << "invalid from_uid";
+            return;
+        }
+
+        QString msgId = jsonObj["msg_id"].toString();
+        if (!msgId.isEmpty()) {
+            if (_seen_msg_ids.contains(msgId)) {
+                qDebug() << "[TCP]" << sourceTag << "duplicate msg_id=" << msgId << ", discarded";
+                return;
+            }
+            _seen_msg_ids.insert(msgId);
+            _seen_msg_ids_fifo.append(msgId);
+            if (_seen_msg_ids_fifo.size() > kMaxSeenMsgIds) {
+                _seen_msg_ids.remove(_seen_msg_ids_fifo.takeFirst());
+            }
+        }
+
+        QString content = jsonObj["content"].toString();
+        qint64 timestamp = jsonObj["timestamp"].toVariant().toLongLong();
+        QString streamStatus = jsonObj["stream_status"].toString();
+        if (!streamStatus.isEmpty()) {
+            QString streamId = jsonObj["stream_id"].toString();
+            qDebug() << "[TCP]" << sourceTag << "stream frame"
+                     << "status=" << streamStatus << "stream_id=" << streamId;
+            if (streamStatus == "start") {
+                emit sig_stream_start(from_uid, streamId, timestamp);
+            } else if (streamStatus == "streaming") {
+                emit sig_stream_chunk(from_uid, streamId, content);
+            } else if (streamStatus == "end") {
+                emit sig_stream_end(from_uid, streamId);
+            }
+            return;
+        }
+
+        qDebug() << "[TCP]" << sourceTag << "plain message from=" << from_uid
+                 << "len=" << content.size();
+        plainDispatch(from_uid, content, timestamp);
+    };
     // 认证响应
     _handlers[ID_CHAT_LOGIN_RSP] = [this](QJsonObject jsonObj) {
         int error = jsonObj["error"].toInt();
@@ -101,9 +223,8 @@ void TcpMgr::initHandlers() {
             return;
         }
 
-        qDebug() << "Chat server authentication successful!";
         bool wasReconnect = (_reconnect_attempt > 0);
-        _reconnect_attempt = 0;   // 重置退退计数器
+        _reconnect_attempt = 0;
         _is_logged_in      = true;
         _state             = ConnectState::Connected;
         startHeartbeat();
@@ -116,23 +237,40 @@ void TcpMgr::initHandlers() {
         }
     };
     
-    // 接收文本消息
-    _handlers[ID_TEXT_CHAT_MSG] = [this](QJsonObject jsonObj) {
-        int from_uid = jsonObj["from_uid"].toInt();
-        QString content = jsonObj["content"].toString();
-        qint64 timestamp = jsonObj["timestamp"].toVariant().toLongLong();
-        
-        qDebug() << "Received text message from" << from_uid << ":" << content;
-        emit sig_text_msg_received(from_uid, content, timestamp);
+    // 文本消息/流式回复
+    _handlers[ID_TEXT_CHAT_MSG] = [dispatchChatLikePayload, this](QJsonObject jsonObj) {
+        dispatchChatLikePayload(
+            jsonObj,
+            "text",
+            [this](int from_uid, const QString &content, qint64 timestamp) {
+                emit sig_text_msg_received(from_uid, content, timestamp);
+            });
     };
-    
+
     // 发送消息响应
+    _handlers[ID_AI_CHAT_MSG] = [dispatchChatLikePayload, this](QJsonObject jsonObj) {
+        dispatchChatLikePayload(
+            jsonObj,
+            "ai",
+            [this](int from_uid, const QString &content, qint64 timestamp) {
+                emit sig_ai_text_msg_received(from_uid, content, timestamp);
+            });
+    };
+
     _handlers[ID_TEXT_CHAT_MSG_RSP] = [this](QJsonObject jsonObj) {
         int error = jsonObj["error"].toInt();
         if (error != ErrorCodes::Success) {
-            qDebug() << "Send message failed";
-        } else {
-            qDebug() << "Message sent successfully";
+            qWarning() << "[TCP] Send message failed: error=" << error;
+            return;
+        }
+
+        if (jsonObj["echo_self"].toBool()) {
+            const int to_uid = jsonObj["to_uid"].toInt();
+            const QString content = jsonObj["content"].toString();
+            const qint64 timestamp = jsonObj["timestamp"].toVariant().toLongLong();
+            qDebug() << "[TCP] self echo message to=" << to_uid
+                     << "len=" << content.size();
+            emit sig_text_msg_self_echo(to_uid, content, timestamp);
         }
     };
 
@@ -140,17 +278,18 @@ void TcpMgr::initHandlers() {
     _handlers[ID_ADD_FRIEND_RSP] = [this](QJsonObject jsonObj) {
         int error = jsonObj["error"].toInt();
         QString msg = jsonObj["msg"].toString();
-        qDebug() << "[TCP] AddFriend RSP: error=" << error << "msg=" << msg;
         emit sig_add_friend_rsp(error, msg);
     };
 
     // 收到别人发来的好友申请通知（接收方）
     _handlers[ID_NOTIFY_ADD_FRIEND] = [this](QJsonObject jsonObj) {
         int     from_uid  = jsonObj["from_uid"].toInt();
+        if (from_uid <= 0) {
+            qWarning() << "[TCP] NOTIFY_ADD_FRIEND: invalid from_uid, discarded";
+            return;
+        }
         QString from_name = jsonObj["from_name"].toString();
         QString message   = jsonObj["message"].toString();
-        qDebug() << "[TCP] NOTIFY_ADD_FRIEND from uid=" << from_uid
-                 << " name=" << from_name;
         emit sig_notify_add_friend(from_uid, from_name, message);
     };
 
@@ -158,13 +297,11 @@ void TcpMgr::initHandlers() {
     _handlers[ID_ACCEPT_FRIEND_RSP] = [this](QJsonObject jsonObj) {
         int error = jsonObj["error"].toInt();
         if (error != ErrorCodes::Success) {
-            qDebug() << "[TCP] AcceptFriend RSP error=" << error;
+            qWarning() << "[TCP] AcceptFriend RSP error=" << error;
             return;
         }
         int     friend_uid  = jsonObj["friend_uid"].toInt();
         QString friend_name = jsonObj["friend_name"].toString();
-        qDebug() << "[TCP] AcceptFriend RSP: friend_uid=" << friend_uid
-                 << " friend_name=" << friend_name;
         emit sig_accept_friend_rsp(friend_uid, friend_name);
     };
 
@@ -172,22 +309,18 @@ void TcpMgr::initHandlers() {
     _handlers[ID_NOTIFY_ACCEPT_FRIEND] = [this](QJsonObject jsonObj) {
         int     from_uid  = jsonObj["from_uid"].toInt();
         QString from_name = jsonObj["from_name"].toString();
-        qDebug() << "[TCP] NOTIFY_ACCEPT_FRIEND from uid=" << from_uid
-                 << " name=" << from_name;
         emit sig_notify_accept_friend(from_uid, from_name);
     };
 
     // 登录时服务端推送好友列表
     _handlers[ID_FRIENDS_LIST_RSP] = [this](QJsonObject jsonObj) {
         QJsonArray arr = jsonObj["friends"].toArray();
-        qDebug() << "[TCP] FRIENDS_LIST_RSP: received" << arr.size() << "friends";
         emit sig_friends_list(arr);
     };
 
     // 心跳 pong
     _handlers[ID_HEARTBEAT] = [this](QJsonObject /*jsonObj*/) {
-        qDebug() << "[TCP] Pong received.";
-        _pong_timer->stop();   // 收到噪声，停止超时定时器
+        _pong_timer->stop();   // 收到 pong，停止超时定时器
     };
 
     // MinIO 文件传输（新协议，支持离线）
@@ -203,12 +336,20 @@ void TcpMgr::initHandlers() {
     _handlers[ID_FILE_MINIO_REFRESH_RSP] = [](QJsonObject json) {
         FileTransferMgr::GetInstance()->OnMinioRefreshRsp(json);
     };
+    _handlers[ID_FILE_MINIO_MP_INIT_RSP] = [](QJsonObject json) {
+        FileTransferMgr::GetInstance()->OnMpInitRsp(json);
+    };
+    _handlers[ID_FILE_MINIO_MP_COMPLETE_RSP] = [](QJsonObject json) {
+        FileTransferMgr::GetInstance()->OnMpCompleteRsp(json);
+    };
+    _handlers[ID_FILE_MINIO_MP_RESUME_RSP] = [](QJsonObject json) {
+        FileTransferMgr::GetInstance()->OnMpResumeRsp(json);
+    };
 
     // 删除好友响应
     _handlers[ID_DELETE_FRIEND_RSP] = [this](QJsonObject jsonObj) {
         int error     = jsonObj["error"].toInt();
         int friendUid = jsonObj["friend_uid"].toInt();
-        qDebug() << "[TCP] DELETE_FRIEND_RSP: error=" << error << "uid=" << friendUid;
         emit sig_delete_friend_rsp(error, friendUid);
     };
 
@@ -216,7 +357,6 @@ void TcpMgr::initHandlers() {
     _handlers[ID_BLOCK_FRIEND_RSP] = [this](QJsonObject jsonObj) {
         int error     = jsonObj["error"].toInt();
         int friendUid = jsonObj["friend_uid"].toInt();
-        qDebug() << "[TCP] BLOCK_FRIEND_RSP: error=" << error << "uid=" << friendUid;
         emit sig_block_friend_rsp(error, friendUid);
     };
 
@@ -225,20 +365,78 @@ void TcpMgr::initHandlers() {
         int error         = jsonObj["error"].toInt();
         QString name      = jsonObj["name"].toString();
         QString signature = jsonObj["signature"].toString();
-        qDebug() << "[TCP] UPDATE_PROFILE_RSP: error=" << error << "name=" << name;
         emit sig_update_profile_rsp(error, name, signature);
+    };
+
+    _handlers[ID_CREATE_GROUP_RSP] = [this](QJsonObject jsonObj) {
+        emit sig_group_created(
+            jsonObj["error"].toInt(),
+            JsonIdToString(jsonObj["group_id"]),
+            jsonObj["group_name"].toString(),
+            jsonObj["member_count"].toInt(),
+            jsonObj["msg"].toString());
+    };
+
+    _handlers[ID_GROUP_INFO_RSP] = [this](QJsonObject jsonObj) {
+        emit sig_group_info_received(
+            jsonObj["error"].toInt(),
+            JsonIdToString(jsonObj["group_id"]),
+            jsonObj["group_name"].toString(),
+            jsonObj["avatar_path"].toString(),
+            jsonObj["notice"].toString(),
+            jsonObj["owner_uid"].toInt(),
+            jsonObj["member_count"].toInt(),
+            jsonObj["msg"].toString());
+    };
+
+    _handlers[ID_GROUP_MEMBER_LIST_RSP] = [this](QJsonObject jsonObj) {
+        emit sig_group_members_received(
+            jsonObj["error"].toInt(),
+            JsonIdToString(jsonObj["group_id"]),
+            jsonObj["members"].toArray(),
+            jsonObj["msg"].toString());
+    };
+
+    _handlers[ID_GROUP_TEXT_MSG] = [this](QJsonObject jsonObj) {
+        const QString groupId = JsonIdToString(jsonObj["group_id"]);
+        const int senderUid = jsonObj["sender_uid"].toInt();
+        if (groupId.isEmpty() || senderUid <= 0) {
+            qWarning() << "[TCP] Invalid group text payload";
+            return;
+        }
+
+        emit sig_group_text_msg_received(
+            groupId,
+            senderUid,
+            jsonObj["content"].toString(),
+            jsonObj["timestamp"].toVariant().toLongLong(),
+            JsonIdToString(jsonObj["msg_id"]));
+    };
+
+    _handlers[ID_GROUP_TEXT_MSG_RSP] = [this](QJsonObject jsonObj) {
+        emit sig_group_text_msg_rsp(
+            jsonObj["error"].toInt(),
+            JsonIdToString(jsonObj["group_id"]),
+            JsonIdToString(jsonObj["msg_id"]),
+            jsonObj["timestamp"].toVariant().toLongLong(),
+            jsonObj["msg"].toString());
+    };
+
+    _handlers[ID_GROUP_SYNC_RSP] = [this](QJsonObject jsonObj) {
+        emit sig_group_sync_received(
+            jsonObj["error"].toInt(),
+            JsonIdToString(jsonObj["group_id"]),
+            JsonIdToString(jsonObj["latest_msg_id"]),
+            jsonObj["messages"].toArray(),
+            jsonObj["msg"].toString());
     };
     _handlers[ID_WEBRTC_SIGNALING] = [this](QJsonObject jsonObj) {
         // 1. 优先检查服务器返回的错误码
         if (jsonObj.contains("error")) {
             int errCode = jsonObj["error"].toInt();
             if (errCode != 0) { // 0 通常代表 Success，非 0 代表出错了
-                qDebug() << "[TCP] WebRTC 信令发送失败，错误码:" << errCode;
-
-                // 如果是对方离线 (假设你的 ErrorCodes::UserOffline 是某个特定值)
-                // 这里你可以直接调用挂断逻辑并提示 UI
+        qDebug() << "[TCP] WebRTC 信令发送失败，错误码:" << errCode;
                 WebRTCMgr::GetInstance().HangUp();
-                // emit sig_callFailed("对方不在线或通话请求失败");
                 return;
             }
         }
@@ -261,35 +459,26 @@ void TcpMgr::initHandlers() {
         // 3. 根据 type 路由给 WebRTCMgr
         if (type == "webrtc_offer") {
             QString sdp = payload["sdp"].toString();
-            // 收到视频通话邀请
             WebRTCMgr::GetInstance().HandleRemoteOffer(fromUid, sdp);
         }
         else if (type == "webrtc_answer") {
             QString sdp = payload["sdp"].toString();
-            // 对方同意了视频通话
             WebRTCMgr::GetInstance().HandleRemoteAnswer(fromUid, sdp);
         }
         else if (type == "webrtc_ice") {
-            // 这里的键名必须与 WebRTCMgr::OnIceCandidate 发送时完全一致
-            QString sdp_mid = payload["sdpMid"].toString(); // 注意：M 大写以符合规范
-            int sdp_mline_index = payload["sdpMLineIndex"].toInt(); // 注意：L, I 大写
+            QString sdp_mid = payload["sdpMid"].toString();
+            int sdp_mline_index = payload["sdpMLineIndex"].toInt();
             QString candidate = payload["candidate"].toString();
-
             WebRTCMgr::GetInstance().HandleRemoteIceCandidate(fromUid, sdp_mid, sdp_mline_index, candidate);
         }
         else if (type == "webrtc_hangup") {
             qDebug() << "[TCP] 对方已挂断";
             WebRTCMgr::GetInstance().HandleRemoteHangUp(fromUid);
         }
-        else {
-            qDebug() << "[TCP] 未知的 WebRTC 信令类型:" << type;
-        }
     };
 }
 
 void TcpMgr::slot_tcp_connect(QString host, QString port, QString token, int uid, QString user) {
-    qDebug() << "[TCP] slot_tcp_connect called";
-
     _host  = host;
     _port  = port;
     _token = token;
@@ -300,12 +489,10 @@ void TcpMgr::slot_tcp_connect(QString host, QString port, QString token, int uid
     _reconnect_attempt = 0;
     _state             = ConnectState::Connecting;
 
-    qDebug() << "[TCP] Connecting to" << _host << ":" << _port.toUShort();
     _socket.connectToHost(_host, _port.toUShort());
 }
 
 void TcpMgr::slot_connected() {
-    qDebug() << "[TCP] Successfully connected to chat server!";
     _state = ConnectState::Connecting;  // 进入认证阶段（认证成功后才算 Connected）
     emit sig_connect_success();
 
@@ -315,11 +502,11 @@ void TcpMgr::slot_connected() {
     authObj["uid"]   = _uid;
     authObj["user"]  = _user;
     SendMsg(ID_CHAT_LOGIN_REQ, authObj);
-    qDebug() << "[TCP] Authentication request sent (uid=" << _uid << ")";
 }
 
 void TcpMgr::slot_disconnected() {
-    qDebug() << "[TCP] Disconnected from chat server";
+    qDebug() << "[TCP] disconnected state=" << static_cast<int>(_state)
+             << "logged_in=" << _is_logged_in;
     stopHeartbeat();
     _data_buffer.clear();
     _pending = false;
@@ -329,12 +516,9 @@ void TcpMgr::slot_disconnected() {
         emit sig_connect_failed();
         scheduleReconnect();
     }
-    // 如果是 Disconnect() 主动断开（_is_logged_in=false）则什么都不做
 }
 
 void TcpMgr::slot_error(QAbstractSocket::SocketError error) {
-    // 连接失败 (ConnectError) 和断线 (RemoteHostClosedError) 不需要现在重连，
-    // slot_disconnected 会随后触发。其他错误直接重连。
     qDebug() << "[TCP] Socket error:" << error << _socket.errorString();
     if (error != QAbstractSocket::RemoteHostClosedError) {
         stopHeartbeat();
@@ -352,19 +536,17 @@ void TcpMgr::slot_error(QAbstractSocket::SocketError error) {
 
 void TcpMgr::slot_do_reconnect()
 {
-    qDebug() << "[TCP] Attempting reconnect #" << _reconnect_attempt;
     _state = ConnectState::Connecting;
-    _socket.abort();   // 确保先前状态清除
+    _socket.abort();
     _socket.connectToHost(_host, _port.toUShort());
 }
 
 void TcpMgr::slot_send_heartbeat()
 {
-    qDebug() << "[TCP] Sending heartbeat ping...";
     QJsonObject ping;
     ping["type"] = "ping";
     SendMsg(ID_HEARTBEAT, ping);
-    // 启动 pong 超时定时器
+    _pong_timer->stop();  // 先停止，避免重叠
     _pong_timer->start(kPongTimeoutMs);
 }
 
@@ -388,6 +570,17 @@ void TcpMgr::slot_read_data() {
             
             // 从缓冲区移除已读取的头部
             _data_buffer.remove(0, 4);
+
+            // 防止恶意/异常的超大包耗尽内存
+            static constexpr quint16 kMaxMsgLen = 60000;
+            if (_cur_msg_len > kMaxMsgLen) {
+                qWarning() << "[TCP] msg_len" << _cur_msg_len << "exceeds limit, disconnecting";
+                _data_buffer.clear();
+                _pending = false;
+                _socket.abort();
+                return;
+            }
+
             _pending = true;
         }
         
@@ -411,22 +604,29 @@ void TcpMgr::slot_read_data() {
 }
 
 void TcpMgr::handleMsg(REQ_ID req_id, quint16 msg_len, QByteArray data) {
-    qDebug() << "Received message: id=" << req_id << ", len=" << msg_len;
-    
-    // 解析JSON
-    QJsonDocument jsonDoc = QJsonDocument::fromJson(data);
-    if (jsonDoc.isNull() || !jsonDoc.isObject()) {
-        qDebug() << "Invalid JSON in message";
+    Q_UNUSED(msg_len)
+
+    if (!IsValidUtf8(data)) {
+        qWarning() << "[TCP] Invalid UTF-8 payload in message id=" << req_id
+                   << "size=" << data.size()
+                   << "hex_prefix=" << data.left(48).toHex(' ');
+        return;
+    }
+
+    QJsonParseError parseError;
+    QJsonDocument jsonDoc = QJsonDocument::fromJson(data, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !jsonDoc.isObject()) {
+        qWarning() << "[TCP] Invalid JSON in message id=" << req_id
+                   << "error=" << parseError.errorString()
+                   << "offset=" << parseError.offset
+                   << "payload_prefix=" << QString::fromUtf8(data.left(160));
         return;
     }
     
     QJsonObject jsonObj = jsonDoc.object();
     
-    // 调用对应的处理器
     if (_handlers.contains(req_id)) {
         _handlers[req_id](jsonObj);
-    } else {
-        qDebug() << "No handler for message id:" << req_id;
     }
 }
 
@@ -448,8 +648,6 @@ void TcpMgr::SendMsg(REQ_ID req_id, const QJsonObject& data) {
     // 发送
     qint64 written = _socket.write(message);
     if (written == -1) {
-        qDebug() << "Failed to send message:" << _socket.errorString();
-    } else {
-        qDebug() << "Sent message: id=" << req_id << ", len=" << len;
+        qWarning() << "[TCP] Failed to send message id=" << req_id << ":" << _socket.errorString();
     }
 }

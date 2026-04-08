@@ -19,6 +19,9 @@
 #include <QPainter>
 #include <QPainterPath>
 #include "FileTransferMgr.h"
+#include <QProcess>
+#include <QDir>
+
 
 /* ---------- 圆形头像 ---------- */
 QPixmap ChatBubbleItem::makeRoundAvatar(const QPixmap &src, int size)
@@ -51,7 +54,7 @@ public:
 
         _doc.setDefaultFont(font());
 
-        static const QRegularExpression emoRe(R"(\[emo:(\d+)\])");
+        static const QRegularExpression emoRe(R"(\[emo:(\d+)\])");;
         QRegularExpressionMatchIterator mi = emoRe.globalMatch(text);
         while (mi.hasNext()) {
             int n = mi.next().captured(1).toInt();
@@ -64,7 +67,23 @@ public:
         }
 
         _doc.setHtml(buildHtml(text));
-        _doc.setTextWidth(380);
+        _text = text;
+        // 自适应宽度：先以自然宽度排版，若超过上限才折行
+        _doc.setTextWidth(-1);
+        const double nw = _doc.size().width();
+        _doc.setTextWidth(nw > 380.0 ? 380.0 : nw);
+    }
+
+    // 追加直接拼接，小新文字效果
+    void appendContent(const QString& piece) {
+        _text += piece;
+        _doc.setHtml(buildHtml(_text));
+        // 重新计算自适应宽度
+        _doc.setTextWidth(-1);
+        const double nw = _doc.size().width();
+        _doc.setTextWidth(nw > 380.0 ? 380.0 : nw);
+        updateGeometry();
+        update();
     }
 
     QSize sizeHint() const override
@@ -97,9 +116,14 @@ protected:
 
     void resizeEvent(QResizeEvent *e) override
     {
-        int w = e->size().width()
-                - contentsMargins().left() - contentsMargins().right();
-        _doc.setTextWidth(qMax(w, 50));
+        // 仅在父布局分配的宽度小于自然宽度时才折行，不在此基础上向外扩展
+        const int contentW = e->size().width()
+                           - contentsMargins().left() - contentsMargins().right();
+        if (contentW < 50) { QWidget::resizeEvent(e); return; }
+        _doc.setTextWidth(-1);
+        const double nw = _doc.size().width();
+        const double target = qMin(nw, 380.0);
+        _doc.setTextWidth(contentW < target ? qMax(contentW, 50) : target);
         updateGeometry();
         update();
     }
@@ -133,6 +157,7 @@ private:
 
     bool            _isSelf;
     mutable QTextDocument _doc;
+    QString         _text;  // 原始文本，用于追加
 };
 
 
@@ -261,6 +286,7 @@ ChatBubbleItem::ChatBubbleItem(const QString &text,
     }
 
     BubbleLabel *bubble = new BubbleLabel(text, isSelf, this);
+    _bubble_label = bubble;
     contentCol->addWidget(bubble);
     contentCol->addStretch();
 
@@ -273,6 +299,12 @@ ChatBubbleItem::ChatBubbleItem(const QString &text,
         root->addLayout(contentCol);
         root->addStretch();
     }
+}
+
+void ChatBubbleItem::appendText(const QString &piece)
+{
+    if (_bubble_label)
+        _bubble_label->appendContent(piece);
 }
 
 /* ---------- ChatBubbleItem (图片) ---------- */
@@ -327,8 +359,10 @@ class FileBubbleLabel : public QWidget
 public:
     explicit FileBubbleLabel(const QString &filename, qint64 fileSize,
                              const QString &fileKey, const QString &downloadUrl,
-                             bool isSelf, QWidget *parent = nullptr)
-        : QWidget(parent), _fileKey(fileKey), _downloadUrl(downloadUrl), _filename(filename)
+                             bool isSelf, const QString &localPath = "",
+                             QWidget *parent = nullptr)
+        : QWidget(parent), _fileKey(fileKey), _downloadUrl(downloadUrl),
+          _filename(filename), _localPath(localPath)
     {
         // ��ʽ���ļ���С
         QString sizeStr;
@@ -393,12 +427,30 @@ protected:
 
     void contextMenuEvent(QContextMenuEvent *event) override
     {
-        // ���ͷ��ࣺfileKey Ϊ�գ���δ�н��ղ�Ự���������˵�
-        if (_fileKey.isEmpty()) return;
+        // 发送方有本地路径；接收方有 fileKey；两者都没有则不响应
+        if (_fileKey.isEmpty() && _localPath.isEmpty()) return;
 
         QMenu menu(this);
-        QAction *actSave   = menu.addAction(QString::fromUtf8("���浽����Ŀ¼"));
-        QAction *actSaveAs = menu.addAction(QString::fromUtf8("����Ϊ��"));
+
+        if (!_localPath.isEmpty()) {
+            // ── 发送方：文件在本地，提供打开 / 在文件夹中显示 ──
+            QAction *actOpen   = menu.addAction(QString::fromUtf8("打开文件"));
+            QAction *actReveal = menu.addAction(QString::fromUtf8("在文件夹中显示"));
+            QAction *chosen = menu.exec(event->globalPos());
+            if (!chosen) return;
+            if (chosen == actOpen) {
+                QDesktopServices::openUrl(QUrl::fromLocalFile(_localPath));
+            } else if (chosen == actReveal) {
+                QProcess::startDetached(
+                    "explorer.exe",
+                    { "/select,", QDir::toNativeSeparators(_localPath) });
+            }
+            return;
+        }
+
+        // ── 接收方：从 MinIO 下载 ──
+        QAction *actSave   = menu.addAction(QString::fromUtf8("保存到下载目录"));
+        QAction *actSaveAs = menu.addAction(QString::fromUtf8("另存为\u2026"));
 
         QAction *chosen = menu.exec(event->globalPos());
         if (!chosen) return;
@@ -410,7 +462,7 @@ protected:
         } else if (chosen == actSaveAs) {
             savePath = QFileDialog::getSaveFileName(
                 window(),
-                QString::fromUtf8("����Ϊ"),
+                QString::fromUtf8("另存为"),
                 QStandardPaths::writableLocation(
                     QStandardPaths::DownloadLocation) + "/" + _filename);
         }
@@ -423,6 +475,7 @@ private:
     QString _fileKey;
     QString _downloadUrl;
     QString _filename;
+    QString _localPath;   // 发送方本地路径（非空则为自己发送的文件）
     QColor  _bgColor;
 };
 
@@ -434,6 +487,7 @@ ChatBubbleItem::ChatBubbleItem(const QString &filename,
                                const QPixmap &avatar,
                                bool isSelf,
                                const QString &timeStr,
+                               const QString &localPath,
                                QWidget *parent)
     : QWidget(parent)
 {
@@ -460,7 +514,7 @@ ChatBubbleItem::ChatBubbleItem(const QString &filename,
     }
 
     auto *fileLb = new FileBubbleLabel(filename, fileSize, fileKey, downloadUrl,
-                                       isSelf, this);
+                                       isSelf, localPath, this);
     contentCol->addWidget(fileLb);
     contentCol->addStretch();
 

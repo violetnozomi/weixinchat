@@ -42,7 +42,7 @@ LogicSystem::LogicSystem() {
            beast::ostream(connection->_response.body()) << ", " <<  " value is " << elem.second << std::endl;
        }
    });
-    RePost("/get_varifycode",[](std::shared_ptr<HttpConnection> connection) {
+    RegPost("/get_varifycode",[](std::shared_ptr<HttpConnection> connection) {
         auto body_str = boost::beast::buffers_to_string(connection->_request.body().data());
         std::cout<<"Received POST data: "<<body_str<<std::endl;
         connection->_response.set(http::field::content_type, "application/json");
@@ -56,8 +56,14 @@ LogicSystem::LogicSystem() {
             beast::ostream(connection->_response.body()) << reply;
             return true;
         }
-        auto emial = src_root["email"].asString();
-        GetVarifyRsp rsp = VaiifyGrpcClient::GetInstance()->GetVarifyCode(emial);
+        auto email = src_root["email"].asString();
+        if (email.empty() || email.size() > 254) {
+            root["error"] = ErrorCodes::Error_Json;
+            root["msg"] = "Invalid email";
+            beast::ostream(connection->_response.body()) << root.toStyledString();
+            return true;
+        }
+        GetVarifyRsp rsp = VaiifyGrpcClient::GetInstance()->GetVarifyCode(email);
         std::cout << root["email"].asString() << std::endl;
         root["error"] = 0;
         root["email"] = src_root["email"];
@@ -65,7 +71,7 @@ LogicSystem::LogicSystem() {
         beast::ostream(connection->_response.body()) << reply;
         return true;
     });
-    RePost("/user_register",[](std::shared_ptr<HttpConnection> connection) {
+    RegPost("/user_register",[](std::shared_ptr<HttpConnection> connection) {
 
         auto bodystr = boost::beast::buffers_to_string(connection->_request.body().data());
         std::cout<<"Received POST data: "<<bodystr<<std::endl;
@@ -80,6 +86,30 @@ LogicSystem::LogicSystem() {
             beast::ostream(connection->_response.body()) << reply;
             return true;
         }
+
+        // 输入验证
+        auto user = src_root["user"].asString();
+        auto passwd = src_root["passwd"].asString();
+        auto email = src_root["email"].asString();
+        if (user.empty() || user.size() > 64) {
+            root["error"] = ErrorCodes::Error_Json;
+            root["msg"] = "Username must be 1-64 characters";
+            beast::ostream(connection->_response.body()) << root.toStyledString();
+            return true;
+        }
+        if (passwd.empty() || passwd.size() < 6) {
+            root["error"] = ErrorCodes::Error_Json;
+            root["msg"] = "Password must be at least 6 characters";
+            beast::ostream(connection->_response.body()) << root.toStyledString();
+            return true;
+        }
+        if (email.empty() || email.size() > 254) {
+            root["error"] = ErrorCodes::Error_Json;
+            root["msg"] = "Invalid email";
+            beast::ostream(connection->_response.body()) << root.toStyledString();
+            return true;
+        }
+
         std::string VarifyCode ;
         // 使用CODE_PREFIX前缀获取验证码（与VarifyServer保持一致）
         std::string email = src_root["email"].asString();
@@ -132,7 +162,7 @@ LogicSystem::LogicSystem() {
     beast::ostream(connection->_response.body()) << jsonstr;
     return true;
     });
-    RePost("/reset_pwd",[](std::shared_ptr<HttpConnection> connection) {
+    RegPost("/reset_pwd",[](std::shared_ptr<HttpConnection> connection) {
         auto bodystr = beast::buffers_to_string(connection->_request.body().data());
         std::cout<<"Received POST data: "<<bodystr<<std::endl;
         connection->_response.set(http::field::content_type,"application/json");
@@ -221,7 +251,7 @@ LogicSystem::LogicSystem() {
         beast::ostream(connection->_response.body()) << reply;
         return true;
     });
-    RePost("/user_login",[](std::shared_ptr<HttpConnection> connection) {
+    RegPost("/user_login",[](std::shared_ptr<HttpConnection> connection) {
        auto bodystr = beast::buffers_to_string(connection->_request.body().data());
        std::cout<<"Received POST data: "<<bodystr<<std::endl;
        connection->_response.set(http::field::content_type, "application/json");
@@ -298,7 +328,7 @@ LogicSystem::LogicSystem() {
     // POST /search_user
     // 请求体: { "uid": <请求者uid>, "keyword": "<搜索关键词>" }
     // 响应体: { "error": 0, "users": [ { "uid": N, "name": "..." }, ... ] }
-    RePost("/search_user", [](std::shared_ptr<HttpConnection> connection) {
+    RegPost("/search_user", [](std::shared_ptr<HttpConnection> connection) {
         auto bodystr = beast::buffers_to_string(connection->_request.body().data());
         connection->_response.set(http::field::content_type, "application/json");
 
@@ -368,7 +398,7 @@ bool LogicSystem::HandlePost(std::string url , std::shared_ptr<HttpConnection> c
     return true;
 }
 
-void LogicSystem::RePost(std::string url, HttpHandler handler) {
+void LogicSystem::RegPost(std::string url, HttpHandler handler) {
     _post_handler.insert(std::make_pair(url,handler));
 }
 

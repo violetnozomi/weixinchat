@@ -15,7 +15,6 @@ RedisconPool::RedisconPool(std::size_t poolSize,  const char* host, int port, co
         auto reply = (redisReply*)redisCommand(context,"AUTH %s",_pwd.data());
         if (reply == NULL) {
             redisFree(context);
-            freeReplyObject(reply);
             continue;
         }
         if (reply->type == REDIS_REPLY_ERROR) {

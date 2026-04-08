@@ -3,9 +3,11 @@
 
 #include <QObject>
 #include <QJsonObject>
+#include <QDebug>
 #include <QString>
 #include <memory>
 #include <functional>
+#include <thread>
 
 // WebRTC
 #include "api/scoped_refptr.h"
@@ -52,6 +54,16 @@ public:
     static WebRTCMgr& GetInstance();
 
     bool Init();
+    // Configure ICE servers from config.ini (call before first StartCall).
+    void SetStunServer(const QString &uri) { _stun_server_uri = uri.toStdString(); }
+    void SetTurnServer(const QString &uri,
+                       const QString &username,
+                       const QString &password)
+    {
+        _turn_server_uri = uri.toStdString();
+        _turn_username = username.toStdString();
+        _turn_password = password.toStdString();
+    }
 
     // withVideo=false => 纯语音通话
     void StartCall(int targetUid, bool withVideo = true);
@@ -105,7 +117,9 @@ private:
     WebRTCMgr& operator=(const WebRTCMgr&) = delete;
 
     bool CreatePeerConnection();
+    void CleanupCallResources();
     void SendSignalingMessage(const QString& type, const QJsonObject& payload);
+    void SendSignalingMessageTo(int targetUid, const QString& type, const QJsonObject& payload);
 
     // 线程收敛：所有 PeerConnection / Track 操作走 signaling 线程
     void RunOnSignalingThread(std::function<void()> task);
@@ -117,9 +131,15 @@ private:
     std::unique_ptr<webrtc::Thread> _network_thread;
     std::unique_ptr<webrtc::Thread> _worker_thread;
     std::unique_ptr<webrtc::Thread> _signaling_thread;
+    // ICE servers, configurable from config.ini.
+    std::string _stun_server_uri = "stun:stun.l.google.com:19302";
+    std::string _turn_server_uri;
+    std::string _turn_username;
+    std::string _turn_password;
 
     webrtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> _peer_connection_factory;
     webrtc::scoped_refptr<webrtc::PeerConnectionInterface> _peer_connection;
+    std::thread _factory_thread; // WebRTC event-loop thread
 
     // 本地轨道
     webrtc::scoped_refptr<webrtc::AudioTrackInterface> local_audio_track_;

@@ -4,34 +4,33 @@
 
 #ifndef WXCHAT_SINGLETON_H
 #define WXCHAT_SINGLETON_H
-#include <memory>
+
+#include <iostream>
 #include "const.h"
 
+// Meyers Singleton
+//
+// C++11 保证局部 static 的初始化线程安全（magic statics）。
+// 析构顺序是初始化的逆序，跨单例析构依赖自动安全。
 template <typename T>
 class Singleton {
 protected:
     Singleton() = default;
-
     Singleton(const Singleton&) = delete;
     Singleton& operator=(const Singleton&) = delete;
-    static std::shared_ptr<T> _instance;
 
 public:
-    static std::shared_ptr<T> GetInstance() {
-        static std::once_flag s_flag;  // 必须是static
-        std::call_once(s_flag, []() {
-            _instance = std::shared_ptr<T>(new T);
-        });
-        return _instance;
-    }
-    ~Singleton() {
-        std::cout << "this is singleton destruct" << std::endl;
-    }
-    void PrintAddress() {
-        std::cout << _instance.get() << std::endl;
+    static T* GetInstance() {
+        static T instance;
+        return &instance;
     }
 
+    void PrintAddress() {
+        std::cout << this << std::endl;
+    }
+
+protected:
+    ~Singleton() = default;
 };
-template<typename T>
-std::shared_ptr<T> Singleton<T>::_instance = nullptr;
-#endif //WXCHAT_SINGLETON_H
+
+#endif // WXCHAT_SINGLETON_H

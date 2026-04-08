@@ -1,7 +1,7 @@
 # ==============================================================================
 # Qt 模块配置
 # ==============================================================================
-QT       += core gui network sql multimedia multimediawidgets
+QT       += core gui network sql multimedia multimediawidgets concurrent
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -73,7 +73,8 @@ SOURCES += \
     UI/searchuseritem.cpp \
     UI/emojipickerwidget.cpp \
     UI/timerbtn.cpp \
-    UI/videocalldialog.cpp
+    UI/videocalldialog.cpp \
+    UI/voicecalldialog.cpp
 
 HEADERS += \
     Manager/cameracapturer.h \
@@ -99,6 +100,7 @@ HEADERS += \
     UI/emojipickerwidget.h \
     UI/timerbtn.h \
     UI/videocalldialog.h \
+    UI/voicecalldialog.h \
     UI/videorender.h
 
 # 【已修复】：去掉了多余的 UI 目录，防止 uic.exe 报错
@@ -121,14 +123,20 @@ HEADERS += \
 
 # ── Manager 层 ────────────────────────────────────────────────────────────
 SOURCES += \
+    Manager/CallSessionMgr.cpp \
     Manager/UserMgr.cpp \
     Manager/FriendMgr.cpp \
-    Manager/ChatMgr.cpp
+    Manager/GroupMgr.cpp \
+    Manager/ChatMgr.cpp \
+    Manager/FileTransferMgr.cpp
 
 HEADERS += \
+    Manager/CallSessionMgr.h \
     Manager/UserMgr.h \
     Manager/FriendMgr.h \
-    Manager/ChatMgr.h
+    Manager/GroupMgr.h \
+    Manager/ChatMgr.h \
+    Manager/FileTransferMgr.h
 
 # ── Model 层 ──────────────────────────────────────────────────────────────
 HEADERS += \
@@ -141,13 +149,13 @@ HEADERS += \
 SOURCES += \
     Utils/global.cpp \
     Utils/ChatStorage.cpp \
-    Utils/FileTransferMgr.cpp
+
 
 HEADERS += \
     Utils/Singleton.h \
     Utils/global.h \
     Utils/ChatStorage.h \
-    Utils/FileTransferMgr.h
+
 
 # ── Entry point ───────────────────────────────────────────────────────────
 SOURCES += \

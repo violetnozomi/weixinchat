@@ -25,6 +25,7 @@ void HttpMgr::PostHttpReq(QUrl url, QJsonObject json, REQ_ID req_id, Modules mod
     QNetworkRequest Request(url);
     Request.setHeader(QNetworkRequest::ContentTypeHeader,"application/json");
     Request.setHeader(QNetworkRequest::ContentLengthHeader,QByteArray::number(data.length()));
+    Request.setTransferTimeout(30000); // 30秒超时
     auto self = shared_from_this();
     QNetworkReply* Reply = _manger->post(Request,data);
     qDebug() << "[HTTP] Request sent, waiting for response...";

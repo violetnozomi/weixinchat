@@ -1,0 +1,1 @@
+"id"	"from_uid"	"to_uid"	"content"	"type"	"created_at"	"delivered"

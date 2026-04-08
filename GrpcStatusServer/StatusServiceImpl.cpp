@@ -22,9 +22,19 @@ StatusServiceImpl::StatusServiceImpl():_chatserver_index(0) {
 Status StatusServiceImpl::GetChatServer(ServerContext *context, const GetChatServerReq *request, GetChatServerRsp *reply) {
     std::cout << "GetChatServer request: uid=" << request->uid() << std::endl;
     
-    // 轮询选择ChatServer
-    _chatserver_index = (_chatserver_index + 1) % _chatServers.size();
-    auto chatserver = _chatServers[_chatserver_index];
+    if (request->uid() <= 0) {
+        reply->set_error(ErrorCodes::Error_Json);
+        return Status::OK;
+    }
+
+    // 线程安全的轮询选择ChatServer
+    if (_chatServers.empty()) {
+        std::cerr << "No ChatServers configured!" << std::endl;
+        reply->set_error(ErrorCodes::RPCFailed);
+        return Status::OK;
+    }
+    int idx = _chatserver_index.fetch_add(1, std::memory_order_relaxed) % static_cast<int>(_chatServers.size());
+    auto chatserver = _chatServers[idx];
     
     // 生成token
     std::string token = Get_uuid();
@@ -33,7 +43,12 @@ Status StatusServiceImpl::GetChatServer(ServerContext *context, const GetChatSer
     std::string token_key = "token:" + token;
     std::string uid_str = std::to_string(request->uid());
     
+    // 使用 SETEX 设置 Token 过期时间（7天 = 604800秒）
     bool set_result = RedisMgr::GetInstance()->Set(token_key, uid_str);
+    if (set_result) {
+        // 设置过期时间 7 天
+        RedisMgr::GetInstance()->Expire(token_key, 7 * 24 * 3600);
+    }
     if (!set_result) {
         std::cerr << "Failed to store token in Redis" << std::endl;
         reply->set_error(ErrorCodes::RPCFailed);

@@ -26,7 +26,7 @@ private:
     std::string UrlEncode(const std::string& str);
     std::string UrlDecode(const std::string& str);
     void PreParseGetParam();
-    void Cheakdeadline();
+    void CheckDeadline();
     void HandleRequest();
     void WriteResponse();
     tcp::socket _socket;

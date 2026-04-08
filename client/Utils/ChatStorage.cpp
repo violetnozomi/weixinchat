@@ -1,12 +1,48 @@
 #include "ChatStorage.h"
-#include <QSqlQuery>
-#include <QSqlError>
-#include <QStandardPaths>
-#include <QDir>
+
+#include <QDateTime>
 #include <QDebug>
+#include <QDir>
+#include <QSqlError>
+#include <QSqlQuery>
+#include <QStandardPaths>
 #include <QVariant>
 
-// ─────────────────────────────────────────────────────────────────────────────
+namespace {
+
+constexpr const char *kMessagesTable = "messages_v2";
+
+bool TableExists(QSqlDatabase &db, const QString &tableName)
+{
+    QSqlQuery q(db);
+    q.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=:name");
+    q.bindValue(":name", tableName);
+    return q.exec() && q.next();
+}
+
+int TableRowCount(QSqlDatabase &db, const QString &tableName)
+{
+    QSqlQuery q(db);
+    if (!q.exec(QString("SELECT COUNT(*) FROM %1").arg(tableName))) {
+        return 0;
+    }
+    return q.next() ? q.value(0).toInt() : 0;
+}
+
+QString BuildConversationKeyForStorage(const MessageInfo &msg)
+{
+    if (!msg.conversationKey.isEmpty()) {
+        return msg.conversationKey;
+    }
+    if (msg.conversationType == ConversationType::Group || !msg.groupId.isEmpty()) {
+        return MakeGroupConversationKey(msg.groupId);
+    }
+
+    const int peerUid = msg.isSelf ? msg.toUid : msg.fromUid;
+    return MakePeerConversationKey(peerUid);
+}
+
+} // namespace
 
 ChatStorage::ChatStorage() = default;
 
@@ -15,24 +51,27 @@ ChatStorage::~ChatStorage()
     Close();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Init
-// ─────────────────────────────────────────────────────────────────────────────
-
 bool ChatStorage::Init(int selfUid)
 {
-    if (_is_open && _self_uid == selfUid) return true;  // 已经打开过
-    if (_is_open) Close();
+    if (_is_open && _self_uid == selfUid) {
+        return true;
+    }
+    if (_is_open) {
+        Close();
+    }
 
     _self_uid = selfUid;
 
-    // 数据库文件目录：%AppData%/weixinchat  (Windows)
-    //                  ~/.local/share/weixinchat (Linux)
-    QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    const QString dataDir = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
     QDir().mkpath(dataDir);
 
-    QString dbPath = dataDir + QString("/chat_%1.db").arg(selfUid);
+    const QString dbPath = dataDir + QString("/chat_%1.db").arg(selfUid);
     _connection_name = QString("chat_db_%1").arg(selfUid);
+
+    // 先移除同名连接（若存在），避免 addDatabase 警告
+    if (QSqlDatabase::contains(_connection_name)) {
+        QSqlDatabase::removeDatabase(_connection_name);
+    }
 
     qDebug() << "[ChatStorage] Opening DB:" << dbPath;
 
@@ -52,10 +91,10 @@ bool ChatStorage::Init(int selfUid)
 
     _is_open = true;
 
-    // 启动时清理超过 365 天的本地消息
-    int removed = DeleteOldMessages(365);
-    if (removed > 0)
+    const int removed = DeleteOldMessages(365);
+    if (removed > 0) {
         qDebug() << "[ChatStorage] Cleaned up" << removed << "old local messages";
+    }
 
     qDebug() << "[ChatStorage] Init OK for uid=" << selfUid;
     return true;
@@ -63,7 +102,10 @@ bool ChatStorage::Init(int selfUid)
 
 void ChatStorage::Close()
 {
-    if (!_is_open) return;
+    if (!_is_open) {
+        return;
+    }
+
     _db.close();
     QSqlDatabase::removeDatabase(_connection_name);
     _is_open = false;
@@ -71,33 +113,59 @@ void ChatStorage::Close()
     qDebug() << "[ChatStorage] Closed";
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Schema
-// ─────────────────────────────────────────────────────────────────────────────
-
 bool ChatStorage::createSchema()
 {
     QSqlQuery q(_db);
-    // messages 表：存储所有聊天记录
-    // peer_uid = 会话的对方 uid（不管消息方向，都用同一个 peer_uid 归档）
-    bool ok = q.exec(R"(
-        CREATE TABLE IF NOT EXISTS messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            peer_uid    INTEGER NOT NULL,
-            from_uid    INTEGER NOT NULL,
-            to_uid      INTEGER NOT NULL,
-            content     TEXT    NOT NULL,
-            timestamp   INTEGER NOT NULL,   -- Unix秒
-            is_self     INTEGER NOT NULL,   -- 1=自己发的, 0=对方发的
-            type        INTEGER NOT NULL DEFAULT 0  -- 0=文本
+    const bool ok = q.exec(QString(R"(
+        CREATE TABLE IF NOT EXISTS %1 (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            conversation_key  TEXT    NOT NULL,
+            conversation_type INTEGER NOT NULL DEFAULT 0,
+            group_id          TEXT    NOT NULL DEFAULT '',
+            server_msg_id     TEXT    NOT NULL DEFAULT '',
+            from_uid          INTEGER NOT NULL,
+            to_uid            INTEGER NOT NULL DEFAULT 0,
+            content           TEXT    NOT NULL,
+            timestamp         INTEGER NOT NULL,
+            is_self           INTEGER NOT NULL,
+            type              INTEGER NOT NULL DEFAULT 0
         )
-    )");
+    )").arg(kMessagesTable));
     if (!ok) {
         qWarning() << "[ChatStorage] createSchema error:" << q.lastError().text();
         return false;
     }
-    // 按 peer_uid + timestamp 的联合索引，加速历史加载
-    q.exec("CREATE INDEX IF NOT EXISTS idx_peer_time ON messages(peer_uid, timestamp)");
+
+    q.exec(QString(
+        "CREATE INDEX IF NOT EXISTS idx_messages_v2_conv_time "
+        "ON %1(conversation_key, timestamp)").arg(kMessagesTable));
+
+    if (TableExists(_db, "messages") && TableRowCount(_db, kMessagesTable) == 0) {
+        QSqlQuery migrate(_db);
+        const bool migrated = migrate.exec(QString(R"(
+            INSERT INTO %1(
+                conversation_key, conversation_type, group_id, server_msg_id,
+                from_uid, to_uid, content, timestamp, is_self, type
+            )
+            SELECT
+                'u:' || peer_uid,
+                0,
+                '',
+                '',
+                from_uid,
+                to_uid,
+                content,
+                timestamp,
+                is_self,
+                type
+            FROM messages
+        )").arg(kMessagesTable));
+        if (!migrated) {
+            qWarning() << "[ChatStorage] migrate legacy messages error:"
+                       << migrate.lastError().text();
+        }
+    }
+
     return true;
 }
 
@@ -110,62 +178,136 @@ bool ChatStorage::ensureOpen() const
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// SaveMessage
-// ─────────────────────────────────────────────────────────────────────────────
-
 bool ChatStorage::SaveMessage(const MessageInfo &msg)
 {
-    if (!ensureOpen()) return false;
+    if (!ensureOpen()) {
+        return false;
+    }
 
-    // 确定 peer_uid
-    const int peerUid = msg.isSelf ? msg.toUid : msg.fromUid;
-
-    // 如果 time 为空，使用当前时刻
-    qint64 ts = msg.time.isValid()
-                ? msg.time.toSecsSinceEpoch()
-                : QDateTime::currentSecsSinceEpoch();
+    const QString conversationKey = BuildConversationKeyForStorage(msg);
+    const ConversationType conversationType =
+        IsGroupConversationKey(conversationKey) ? ConversationType::Group : ConversationType::Peer;
+    const QString groupId = msg.groupId.isNull() ? QString("") : msg.groupId;
+    const QString serverMsgId = msg.msgId.isNull() ? QString("") : msg.msgId;
+    const QString content = msg.content.isNull() ? QString("") : msg.content;
+    const qint64 ts = msg.time.isValid()
+        ? msg.time.toSecsSinceEpoch()
+        : QDateTime::currentSecsSinceEpoch();
 
     QSqlQuery q(_db);
-    q.prepare(
-        "INSERT INTO messages(peer_uid, from_uid, to_uid, content, timestamp, is_self, type)"
-        " VALUES(:peer, :from, :to, :content, :ts, :self, :type)"
-    );
-    q.bindValue(":peer",    peerUid);
-    q.bindValue(":from",    msg.fromUid);
-    q.bindValue(":to",      msg.toUid);
-    q.bindValue(":content", msg.content);
-    q.bindValue(":ts",      ts);
-    q.bindValue(":self",    msg.isSelf ? 1 : 0);
-    q.bindValue(":type",    static_cast<int>(msg.type));
+    q.prepare(QString(
+        "INSERT INTO %1("
+        " conversation_key, conversation_type, group_id, server_msg_id,"
+        " from_uid, to_uid, content, timestamp, is_self, type)"
+        " VALUES(:conversation_key, :conversation_type, :group_id, :server_msg_id,"
+        " :from_uid, :to_uid, :content, :timestamp, :is_self, :type)"
+    ).arg(kMessagesTable));
+    q.bindValue(":conversation_key", conversationKey);
+    q.bindValue(":conversation_type", static_cast<int>(conversationType));
+    q.bindValue(":group_id", groupId);
+    q.bindValue(":server_msg_id", serverMsgId);
+    q.bindValue(":from_uid", msg.fromUid);
+    q.bindValue(":to_uid", msg.toUid);
+    q.bindValue(":content", content);
+    q.bindValue(":timestamp", ts);
+    q.bindValue(":is_self", msg.isSelf ? 1 : 0);
+    q.bindValue(":type", static_cast<int>(msg.type));
 
     if (!q.exec()) {
         qWarning() << "[ChatStorage] SaveMessage error:" << q.lastError().text();
         return false;
     }
+
     return true;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// LoadHistory
-// ─────────────────────────────────────────────────────────────────────────────
-
-QVector<MessageInfo> ChatStorage::LoadHistory(int peerUid, int limit)
+bool ChatStorage::UpdatePendingGroupTextAck(const QString &conversationKey,
+                                            const QString &serverMsgId,
+                                            const QDateTime &serverTime)
 {
-    QVector<MessageInfo> result;
-    if (!ensureOpen()) return result;
+    if (!ensureOpen() || conversationKey.isEmpty() || serverMsgId.isEmpty()) {
+        return false;
+    }
+
+    const qint64 ts = serverTime.isValid()
+        ? serverTime.toSecsSinceEpoch()
+        : QDateTime::currentSecsSinceEpoch();
 
     QSqlQuery q(_db);
-    // 先取最近 limit 条（倒序），再反转为正序
-    q.prepare(
-        "SELECT from_uid, to_uid, content, timestamp, is_self, type"
-        " FROM messages"
-        " WHERE peer_uid = :peer"
+    q.prepare(QString(R"(
+        UPDATE %1
+        SET server_msg_id = :server_msg_id,
+            timestamp = :timestamp
+        WHERE id = (
+            SELECT id
+            FROM %1
+            WHERE conversation_key = :conversation_key
+              AND conversation_type = :conversation_type
+              AND is_self = 1
+              AND type = :type
+              AND server_msg_id = ''
+            ORDER BY timestamp ASC, id ASC
+            LIMIT 1
+        )
+    )").arg(kMessagesTable));
+    q.bindValue(":server_msg_id", serverMsgId);
+    q.bindValue(":timestamp", ts);
+    q.bindValue(":conversation_key", conversationKey);
+    q.bindValue(":conversation_type", static_cast<int>(ConversationType::Group));
+    q.bindValue(":type", static_cast<int>(MessageInfo::Text));
+
+    if (!q.exec()) {
+        qWarning() << "[ChatStorage] UpdatePendingGroupTextAck error:" << q.lastError().text();
+        return false;
+    }
+
+    return q.numRowsAffected() > 0;
+}
+
+QString ChatStorage::GetLatestServerMsgId(const QString &conversationKey)
+{
+    if (!ensureOpen() || conversationKey.isEmpty()) {
+        return QString();
+    }
+
+    QSqlQuery q(_db);
+    q.prepare(QString(
+        "SELECT server_msg_id FROM %1 "
+        "WHERE conversation_key = :conversation_key AND server_msg_id <> '' "
+        "ORDER BY timestamp DESC, id DESC LIMIT 1"
+    ).arg(kMessagesTable));
+    q.bindValue(":conversation_key", conversationKey);
+
+    if (!q.exec()) {
+        qWarning() << "[ChatStorage] GetLatestServerMsgId error:" << q.lastError().text();
+        return QString();
+    }
+
+    if (!q.next()) {
+        return QString();
+    }
+    return q.value(0).toString();
+}
+
+QVector<MessageInfo> ChatStorage::LoadHistory(const QString &conversationKey, int limit)
+{
+    QVector<MessageInfo> result;
+    if (!ensureOpen() || !IsValidConversationKey(conversationKey)) {
+        return result;
+    }
+    limit = qBound(1, limit, 5000);
+
+    QSqlQuery q(_db);
+    q.prepare(QString(
+        "SELECT conversation_type, group_id, server_msg_id, from_uid, to_uid,"
+        " content, timestamp, is_self, type"
+        " FROM %1"
+        " WHERE conversation_key = :conversation_key"
         " ORDER BY timestamp DESC, id DESC"
-        " LIMIT :lim"
-    );
-    q.bindValue(":peer", peerUid);
-    q.bindValue(":lim",  limit);
+        " LIMIT :limit"
+    ).arg(kMessagesTable));
+    q.bindValue(":conversation_key", conversationKey);
+    q.bindValue(":limit", limit);
 
     if (!q.exec()) {
         qWarning() << "[ChatStorage] LoadHistory error:" << q.lastError().text();
@@ -173,65 +315,87 @@ QVector<MessageInfo> ChatStorage::LoadHistory(int peerUid, int limit)
     }
 
     while (q.next()) {
-        MessageInfo m;
-        m.fromUid = q.value(0).toInt();
-        m.toUid   = q.value(1).toInt();
-        m.content = q.value(2).toString();
-        m.time    = QDateTime::fromSecsSinceEpoch(q.value(3).toLongLong());
-        m.isSelf  = q.value(4).toInt() == 1;
-        m.type    = static_cast<MessageInfo::Type>(q.value(5).toInt());
-        result.prepend(m);   // 反转为正序（最早的在最前）
+        MessageInfo msg;
+        msg.conversationKey = conversationKey;
+        msg.conversationType = static_cast<ConversationType>(q.value(0).toInt());
+        msg.groupId = q.value(1).toString();
+        msg.msgId = q.value(2).toString();
+        msg.fromUid = q.value(3).toInt();
+        msg.toUid = q.value(4).toInt();
+        msg.content = q.value(5).toString();
+        msg.time = QDateTime::fromSecsSinceEpoch(q.value(6).toLongLong());
+        msg.isSelf = q.value(7).toInt() == 1;
+        msg.type = static_cast<MessageInfo::Type>(q.value(8).toInt());
+        result.prepend(msg);
     }
 
     qDebug() << "[ChatStorage] Loaded" << result.size()
-             << "messages for peer=" << peerUid;
+             << "messages for conversation=" << conversationKey;
     return result;
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// DeleteOldMessages
-// ─────────────────────────────────────────────────────────────────────────────
-
 int ChatStorage::DeleteOldMessages(int keepDays)
 {
-    if (!ensureOpen()) return 0;
+    if (!ensureOpen()) {
+        return 0;
+    }
 
-    qint64 cutoff = QDateTime::currentSecsSinceEpoch()
-                    - static_cast<qint64>(keepDays) * 86400;
+    const qint64 cutoff = QDateTime::currentSecsSinceEpoch()
+        - static_cast<qint64>(keepDays) * 86400;
 
     QSqlQuery q(_db);
-    q.prepare("DELETE FROM messages WHERE timestamp < :cutoff");
+    q.prepare(QString("DELETE FROM %1 WHERE timestamp < :cutoff").arg(kMessagesTable));
     q.bindValue(":cutoff", cutoff);
 
     if (!q.exec()) {
         qWarning() << "[ChatStorage] DeleteOldMessages error:" << q.lastError().text();
         return 0;
     }
+
     return q.numRowsAffected();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// GetConversationUids
-// ─────────────────────────────────────────────────────────────────────────────
-
-QList<int> ChatStorage::GetConversationUids()
+QList<QString> ChatStorage::GetConversationKeys()
 {
-    QList<int> uids;
-    if (!ensureOpen()) return uids;
+    QList<QString> keys;
+    if (!ensureOpen()) {
+        return keys;
+    }
 
     QSqlQuery q(_db);
-    // 每个 peer_uid 取最新时间戳，按最近会话排列
-    bool ok = q.exec(
-        "SELECT peer_uid FROM messages"
-        " GROUP BY peer_uid"
+    const bool ok = q.exec(QString(
+        "SELECT conversation_key"
+        " FROM %1"
+        " GROUP BY conversation_key"
         " ORDER BY MAX(timestamp) DESC"
-    );
+    ).arg(kMessagesTable));
     if (!ok) {
-        qWarning() << "[ChatStorage] GetConversationUids error:" << q.lastError().text();
-        return uids;
+        qWarning() << "[ChatStorage] GetConversationKeys error:" << q.lastError().text();
+        return keys;
     }
-    while (q.next())
-        uids.append(q.value(0).toInt());
 
-    return uids;
+    QList<QString> invalidKeys;
+    while (q.next()) {
+        const QString conversationKey = q.value(0).toString();
+        if (!IsValidConversationKey(conversationKey)) {
+            invalidKeys.append(conversationKey);
+            continue;
+        }
+        keys.append(conversationKey);
+    }
+
+    for (const QString &conversationKey : invalidKeys) {
+        QSqlQuery cleanup(_db);
+        cleanup.prepare(QString("DELETE FROM %1 WHERE conversation_key = :conversation_key")
+                            .arg(kMessagesTable));
+        cleanup.bindValue(":conversation_key", conversationKey);
+        if (!cleanup.exec()) {
+            qWarning() << "[ChatStorage] cleanup invalid conversation error:"
+                       << conversationKey << cleanup.lastError().text();
+        } else {
+            qWarning() << "[ChatStorage] removed invalid conversation:" << conversationKey;
+        }
+    }
+
+    return keys;
 }

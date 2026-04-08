@@ -28,11 +28,19 @@ int main(int argc, char *argv[])
     QSettings settings(config_path, QSettings::IniFormat);
     QString gate_host = settings.value("GateServer/host").toString();
     QString gate_port = settings.value("GateServer/port").toString();
+    if (gate_host.isEmpty() || gate_port.isEmpty()) {
+        qCritical() << "[Config] GateServer/host or GateServer/port is missing in" << config_path;
+        return 1;
+    }
     gate_url_prefix = "http://"+gate_host+":"+gate_port;
-    qDebug() << "[MAIN] Config loaded:";
-    qDebug() << "[MAIN]   GateServer:" << gate_url_prefix;
-    qDebug() << "[MAIN]   Host:" << gate_host;
-    qDebug() << "[MAIN]   Port:" << gate_port;
+    // Read WebRTC ICE servers from config.
+    QString stunServer = settings.value("WebRTC/stun_server",
+                                        "stun:stun.l.google.com:19302").toString();
+    QString turnServer = settings.value("WebRTC/turn_server", "").toString().trimmed();
+    QString turnUsername = settings.value("WebRTC/turn_username", "").toString();
+    QString turnPassword = settings.value("WebRTC/turn_password", "").toString();
+    WebRTCMgr::GetInstance().SetStunServer(stunServer);
+    WebRTCMgr::GetInstance().SetTurnServer(turnServer, turnUsername, turnPassword);
     if( qss.open(QFile::ReadOnly))
     {
         qDebug("open success");
@@ -45,7 +53,6 @@ int main(int argc, char *argv[])
     WebRTCMgr::GetInstance().Init();
 #if DEBUG_CHAT_DIALOG
     // 调试模式：直接显示聊天界面
-    qDebug() << "[MAIN] DEBUG MODE: Starting chatDialog directly...";
     chatDialog chat;
     chat.show();
     return a.exec();

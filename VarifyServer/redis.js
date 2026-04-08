@@ -11,11 +11,10 @@ const RedisCli = new Redis({
 
 
 /**
- * 监听错误信息
+ * 监听错误信息，ioredis 会自动重连
  */
 RedisCli.on("error", function (err) {
-  console.log("RedisCli connect error");
-  RedisCli.quit();
+  console.log("RedisCli connect error:", err.message);
 });
 
 /**
@@ -71,10 +70,8 @@ async function QueryRedis(key) {
  */
 async function SetRedisExpire(key,value, exptime){
     try{
-        // 设置键和值
-        await RedisCli.set(key,value)
-        // 设置过期时间（以秒为单位）
-        await RedisCli.expire(key, exptime);
+        // 原子性地设置键、值和过期时间，避免 set+expire 之间崩溃导致 key 永不过期
+        await RedisCli.setex(key, exptime, value);
         return true;
     }catch(error){
         console.log('SetRedisExpire error is', error);

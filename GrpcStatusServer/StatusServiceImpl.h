@@ -10,6 +10,7 @@
 #include <boost/asio.hpp>
 #include <boost/uuid.hpp>
 #include <boost/uuid/random_generator.hpp>
+#include <mutex>
 #include "ConfigMgr.h"
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -35,7 +36,8 @@ public:
     Status LoginVerify(ServerContext* context, const LoginVerifyReq* request, LoginVerifyRsp* reply) override;
     Status GetUserServer(ServerContext* context, const GetUserServerReq* request, GetUserServerRsp* reply) override;
     std::vector<ChatServer> _chatServers;
-    int _chatserver_index;
+    std::atomic<int> _chatserver_index;
+    mutable std::mutex _index_mutex;
     std:: string Get_uuid();
 };
 

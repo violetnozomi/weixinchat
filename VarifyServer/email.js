@@ -13,7 +13,7 @@ let transport = nodemailer.createTransport({
         pass: config_module.email_pass // 邮箱授权码（不是QQ密码）
     },
     tls: {
-        rejectUnauthorized: false // 接受自签名证书
+        rejectUnauthorized: true // 拒绝无效证书，防止中间人攻击
     }
 });
 /**
@@ -22,18 +22,22 @@ let transport = nodemailer.createTransport({
  * @returns 
  */
 function SendMail(mailOptions_){
-    return new Promise(function(resolve, reject){
-        transport.sendMail(mailOptions_, function(error, info){
-            if (error) {
-                console.log(error);
-                reject(error);
-            } else {
-                console.log('邮件已成功发送：' + info.response);
-                resolve(info.response)
-            }
-        });
-    })
-
+    return Promise.race([
+        new Promise(function(resolve, reject){
+            transport.sendMail(mailOptions_, function(error, info){
+                if (error) {
+                    console.log(error);
+                    reject(error);
+                } else {
+                    console.log('邮件已成功发送：' + info.response);
+                    resolve(info.response)
+                }
+            });
+        }),
+        new Promise(function(_, reject) {
+            setTimeout(function() { reject(new Error('SendMail timeout (15s)')); }, 15000);
+        })
+    ])
 }
 
 module.exports.SendMail = SendMail

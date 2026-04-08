@@ -19,7 +19,7 @@ struct SectionInfo {
                 return *this;
             }
             _sections_data =  other._sections_data;
-
+            return *this;
         }
 
     std::string operator[](const std::string& key) {

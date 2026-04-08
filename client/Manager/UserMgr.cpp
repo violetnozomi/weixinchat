@@ -1,4 +1,6 @@
 #include "UserMgr.h"
+#include "CallSessionMgr.h"
+#include "GroupMgr.h"
 
 void UserMgr::SetSelfInfo(int uid, const QString &name,
                            const QString &token,
@@ -28,6 +30,8 @@ void UserMgr::UpdateProfile(const QString &name,
 
 void UserMgr::Clear()
 {
+    CallSessionMgr::GetInstance()->Clear();
+    GroupMgr::GetInstance()->Clear();
     _self = SelfInfo{};
     emit sig_logout();
 }

@@ -96,6 +96,7 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    delete _chat_dialog; // chatDialog无父对象，需手动释放
     delete ui;
 }
 

@@ -57,12 +57,13 @@ std::unique_ptr<Session> MysqlConPool::CreateSession() {
 
 std::unique_ptr<Session> MysqlConPool::GetSession() {
     std::unique_lock<std::mutex> lock(mutex_);
-    cond_.wait(lock, [this] {
-        if (b_stop_) return true;
-        return !pool_.empty();
-    });
-
-    if (b_stop_) return nullptr;
+    bool ok = cond_.wait_for(lock, std::chrono::seconds(3),
+                             [this]{ return b_stop_ || !pool_.empty(); });
+    if (!ok || b_stop_) {
+        std::cerr << "[MySQL-GateServer] GetSession: "
+                  << (b_stop_ ? "pool shutdown" : "timeout (3s)") << std::endl;
+        return nullptr;
+    }
 
     auto sess = std::move(pool_.front());
     pool_.pop();
@@ -71,12 +72,15 @@ std::unique_ptr<Session> MysqlConPool::GetSession() {
 
 void MysqlConPool::ReturnSession(std::unique_ptr<Session> sess) {
     std::unique_lock<std::mutex> lock(mutex_);
-    if (b_stop_) return;
+    if (b_stop_) {
+        // 停机时仍正常销毁 session（unique_ptr 析构即可），而非泄漏
+        return;
+    }
 
     // 检查 session 是否还活着，死了就重连一个
-    // 注意：这里简单判断，实际生产可以用 sess->sql("SELECT 1").execute() 测试
     if (!sess) {
         sess = CreateSession();
+        if (!sess) return; // 重连失败就不放回池
     }
 
     pool_.push(std::move(sess));
@@ -132,16 +136,16 @@ int MysqlDao::RegUser(const std::string& name, const std::string& email, const s
         poolObj.get()->sql("START TRANSACTION").execute();
         
         try {
-            poolObj.get()->sql("UPDATE user_id SET id = id + 1").execute();
-            SqlResult idResult = poolObj.get()->sql("SELECT id FROM user_id").execute();
+            // 使用 SELECT ... FOR UPDATE 防止并发分配相同 ID
+            SqlResult idResult = poolObj.get()->sql("SELECT id FROM user_id FOR UPDATE").execute();
             Row idRow = idResult.fetchOne();
             if (!idRow) {
                 poolObj.get()->sql("ROLLBACK").execute();
                 std::cerr << "生成用户ID失败" << std::endl;
                 return -1;
             }
-            
-            int newUid = idRow[0];
+            int newUid = static_cast<int>(idRow[0]) + 1;
+            poolObj.get()->sql("UPDATE user_id SET id = ?").bind(newUid).execute();
 
             // 生成盐值并对密码进行 SHA-256 哈希，存储格式: "salt$sha256hash"
             std::string salt       = GenerateSalt();

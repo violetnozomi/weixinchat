@@ -61,7 +61,9 @@ bool RedisMgr::Get(const std::string &key, std::string &value) {
         return false;
     }
     
-    value = reply->str;
+    if (reply->str != nullptr) {
+        value = std::string(reply->str, reply->len);
+    }
     freeReplyObject(reply);
     return true;
 }
@@ -72,7 +74,10 @@ bool RedisMgr::Set(const std::string &key, const std::string &value) {
         return false;
     }
     
-    auto reply = (redisReply*)redisCommand(guard.getContext(), "SET %s %s", key.c_str(), value.c_str());
+    // 使用二进制安全的 redisCommandArgv，避免值含空格时协议错误
+    const char* argv[] = {"SET", key.c_str(), value.c_str()};
+    size_t argvlen[] = {3, key.length(), value.length()};
+    auto reply = (redisReply*)redisCommandArgv(guard.getContext(), 3, argv, argvlen);
     if (reply == nullptr) {
         std::cout << "[ SET  " << key << " << " << value <<" ] failed: reply为NULL" << std::endl;
         return false;
@@ -345,6 +350,20 @@ void RedisMgr::Close() {
     if (_con_pool) {
         _con_pool->close();
     }
+}
+
+bool RedisMgr::Expire(const std::string &key, int seconds) {
+    RedisConnectionGuard guard(_con_pool.get());
+    if (!guard.isValid()) {
+        return false;
+    }
+    auto reply = (redisReply*)redisCommand(guard.getContext(), "EXPIRE %s %d", key.c_str(), seconds);
+    if (reply == nullptr) {
+        return false;
+    }
+    bool ok = (reply->type == REDIS_REPLY_INTEGER && reply->integer == 1);
+    freeReplyObject(reply);
+    return ok;
 }
 
 

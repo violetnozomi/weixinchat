@@ -1,0 +1,1 @@
+"id"	"from_uid"	"from_name"	"to_uid"	"message"	"status"	"created_at"	"updated_at"

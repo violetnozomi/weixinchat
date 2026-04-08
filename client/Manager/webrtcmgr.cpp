@@ -1,6 +1,8 @@
 // client/Manager/webrtcmgr.cpp
 #include "webrtcmgr.h"
+#include "CallSessionMgr.h"
 #include "tcpmgr.h"
+#include "api/audio_options.h"
 #include "UserMgr.h"
 #include "cameracapturer.h"
 #include "global.h"
@@ -8,16 +10,31 @@
 #include <QCoreApplication>
 #include <QDebug>
 #include <thread>
+#include <mutex>
 
 WebRTCMgr& WebRTCMgr::GetInstance() {
     static WebRTCMgr instance;
     return instance;
 }
 
-WebRTCMgr::WebRTCMgr() {}
+WebRTCMgr::WebRTCMgr() {
+    auto call_mgr = CallSessionMgr::GetInstance();
+    QObject::connect(call_mgr.get(), &CallSessionMgr::sig_call_timeout,
+                     this, [this](int peerUid) {
+        qWarning() << "[WebRTC] call timeout, peer uid =" << peerUid;
+        QJsonObject payload;
+        SendSignalingMessage("webrtc_hangup", payload);
+        CleanupCallResources();
+    });
+}
 
 WebRTCMgr::~WebRTCMgr() {
     HangUp();
+    // Stop the WebRTC event-loop thread and join
+    if (_signaling_thread) _signaling_thread->Quit();
+    if (_network_thread)   _network_thread->Quit();
+    if (_worker_thread)    _worker_thread->Quit();
+    if (_factory_thread.joinable()) _factory_thread.join();
 }
 
 void WebRTCMgr::RunOnSignalingThread(std::function<void()> task) {
@@ -30,9 +47,10 @@ void WebRTCMgr::RunOnSignalingThread(std::function<void()> task) {
 }
 
 bool WebRTCMgr::Init() {
-    static bool inited = false;
-    if (inited) return true;
-    inited = true;
+    static std::once_flag s_init_flag;
+    bool already = true;
+    std::call_once(s_init_flag, [&already]() { already = false; });
+    if (already) return true;
 
     webrtc::InitializeSSL();
 
@@ -45,7 +63,7 @@ bool WebRTCMgr::Init() {
     _worker_thread = webrtc::Thread::Create();
     _worker_thread->Start();
 
-    std::thread([this]() {
+    _factory_thread = std::thread([this]() {
         webrtc::ThreadManager::Instance()->WrapCurrentThread();
 
         _peer_connection_factory = webrtc::CreatePeerConnectionFactory(
@@ -64,7 +82,7 @@ bool WebRTCMgr::Init() {
         else qDebug() << "[WebRTC] factory failed";
 
         webrtc::Thread::Current()->Run();
-    }).detach();
+    });
 
     return true;
 }
@@ -75,11 +93,16 @@ void WebRTCMgr::StartCall(int targetUid, bool withVideo) {
         _with_video = withVideo;
 
         if (!CreatePeerConnection()) return;
+        QMetaObject::invokeMethod(CallSessionMgr::GetInstance().get(),
+                                  [targetUid, withVideo]() {
+            CallSessionMgr::GetInstance()->StartOutgoing(targetUid, withVideo);
+        }, Qt::QueuedConnection);
         _peer_connection->CreateOffer(this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
     });
 }
 
 void WebRTCMgr::acceptCall() {
+    CallSessionMgr::GetInstance()->MarkAccepted();
     RunOnSignalingThread([this]() {
         if (!_peer_connection) return;
         _peer_connection->CreateAnswer(this, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions());
@@ -87,6 +110,14 @@ void WebRTCMgr::acceptCall() {
 }
 
 void WebRTCMgr::HandleRemoteOffer(int fromUid, const QString& sdp) {
+    auto call_mgr = CallSessionMgr::GetInstance();
+    if (call_mgr->IsBusy() && call_mgr->GetPeerUid() != fromUid) {
+        qWarning() << "[WebRTC] busy, rejecting incoming call from uid =" << fromUid;
+        QJsonObject payload;
+        SendSignalingMessageTo(fromUid, "webrtc_hangup", payload);
+        return;
+    }
+
     RunOnSignalingThread([this, fromUid, sdp]() {
         _target_uid = fromUid;
 
@@ -105,6 +136,11 @@ void WebRTCMgr::HandleRemoteOffer(int fromUid, const QString& sdp) {
         _peer_connection->SetRemoteDescription(
             DummySetSessionDescriptionObserver::Create().get(),
             remote.release());
+
+        QMetaObject::invokeMethod(CallSessionMgr::GetInstance().get(),
+                                  [fromUid, withVideo]() {
+            CallSessionMgr::GetInstance()->StartIncoming(fromUid, withVideo);
+        }, Qt::QueuedConnection);
 
         QMetaObject::invokeMethod(this, [this, fromUid, withVideo]() {
             emit sig_incomingCall(fromUid, withVideo);
@@ -126,6 +162,10 @@ void WebRTCMgr::HandleRemoteAnswer(int /*fromUid*/, const QString& sdp) {
         _peer_connection->SetRemoteDescription(
             DummySetSessionDescriptionObserver::Create().get(),
             remote.release());
+
+        QMetaObject::invokeMethod(CallSessionMgr::GetInstance().get(), []() {
+            CallSessionMgr::GetInstance()->MarkAccepted();
+        }, Qt::QueuedConnection);
     });
 }
 
@@ -189,14 +229,17 @@ void WebRTCMgr::OnTrack(webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> t
     auto track = transceiver->receiver()->track();
     if (!track) return;
 
-    if (track->kind() == webrtc::MediaStreamTrackInterface::kVideoKind) {
-        _remote_video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
-        if (_remote_video_track && _remote_sink) {
-            _remote_video_track->AddOrUpdateSink(_remote_sink, webrtc::VideoSinkWants());
+    // OnTrack runs on WebRTC internal thread — dispatch to signaling thread
+    RunOnSignalingThread([this, track]() {
+        if (track->kind() == webrtc::MediaStreamTrackInterface::kVideoKind) {
+            _remote_video_track = static_cast<webrtc::VideoTrackInterface*>(track.get());
+            if (_remote_video_track && _remote_sink) {
+                _remote_video_track->AddOrUpdateSink(_remote_sink, webrtc::VideoSinkWants());
+            }
+        } else if (track->kind() == webrtc::MediaStreamTrackInterface::kAudioKind) {
+            qDebug() << "[WebRTC] remote audio track arrived";
         }
-    } else if (track->kind() == webrtc::MediaStreamTrackInterface::kAudioKind) {
-        qDebug() << "[WebRTC] remote audio track arrived";
-    }
+    });
 }
 
 bool WebRTCMgr::CreatePeerConnection() {
@@ -204,9 +247,20 @@ bool WebRTCMgr::CreatePeerConnection() {
     if (!_peer_connection_factory) return false;
 
     webrtc::PeerConnectionInterface::RTCConfiguration cfg;
-    webrtc::PeerConnectionInterface::IceServer server;
-    server.uri = "stun:stun.l.google.com:19302";
-    cfg.servers.push_back(server);
+    if (!_stun_server_uri.empty()) {
+        webrtc::PeerConnectionInterface::IceServer stun_server;
+        stun_server.uri = _stun_server_uri;
+        stun_server.urls.push_back(_stun_server_uri);
+        cfg.servers.push_back(stun_server);
+    }
+    if (!_turn_server_uri.empty()) {
+        webrtc::PeerConnectionInterface::IceServer turn_server;
+        turn_server.uri = _turn_server_uri;
+        turn_server.urls.push_back(_turn_server_uri);
+        turn_server.username = _turn_username;
+        turn_server.password = _turn_password;
+        cfg.servers.push_back(turn_server);
+    }
 
     webrtc::PeerConnectionDependencies deps(this);
     auto result = _peer_connection_factory->CreatePeerConnectionOrError(cfg, std::move(deps));
@@ -215,8 +269,8 @@ bool WebRTCMgr::CreatePeerConnection() {
     _peer_connection = result.MoveValue();
 
     // 音频轨始终添加（语音通话基础）
-    auto audioSource = _peer_connection_factory->CreateAudioSource(cricket::AudioOptions());
-    local_audio_track_ = _peer_connection_factory->CreateAudioTrack("local_audio_track", audioSource);
+    auto audioSource = _peer_connection_factory->CreateAudioSource(webrtc::AudioOptions{});
+    local_audio_track_ = _peer_connection_factory->CreateAudioTrack("local_audio_track", audioSource.get());
     if (local_audio_track_) {
         _peer_connection->AddTrack(local_audio_track_, {"stream_id"});
     }
@@ -229,12 +283,39 @@ bool WebRTCMgr::CreatePeerConnection() {
     return true;
 }
 
+void WebRTCMgr::CleanupCallResources() {
+    RunOnSignalingThread([this]() {
+        const bool had_call = (_peer_connection != nullptr) || (_target_uid != 0);
+        if (_peer_connection) {
+            _peer_connection->Close();
+            _peer_connection = nullptr;
+        }
+
+        _target_uid = 0;
+        _with_video = true;
+        _remote_sink = nullptr;
+        _remote_video_track = nullptr;
+        local_audio_track_ = nullptr;
+        local_video_track_ = nullptr;
+
+        if (had_call) {
+            QMetaObject::invokeMethod(this, [this]() {
+                emit sig_callEnded();
+            }, Qt::QueuedConnection);
+        }
+    });
+}
+
 void WebRTCMgr::SendSignalingMessage(const QString& type, const QJsonObject& payload) {
-    if (_target_uid == 0) return;
+    SendSignalingMessageTo(_target_uid, type, payload);
+}
+
+void WebRTCMgr::SendSignalingMessageTo(int targetUid, const QString& type, const QJsonObject& payload) {
+    if (targetUid == 0) return;
 
     QJsonObject msg;
     msg["from_uid"] = UserMgr::GetInstance()->GetUid();
-    msg["to_uid"] = _target_uid;
+    msg["to_uid"] = targetUid;
     msg["type"] = type;
     msg["payload"] = payload;
 
@@ -284,6 +365,10 @@ void WebRTCMgr::SetLocalVideoEnabled(bool enabled) {
 
 void WebRTCMgr::setRemoteSink(webrtc::VideoSinkInterface<webrtc::VideoFrame>* sink) {
     RunOnSignalingThread([this, sink]() {
+        // Remove old sink from track before replacing
+        if (_remote_video_track && _remote_sink && _remote_sink != sink) {
+            _remote_video_track->RemoveSink(_remote_sink);
+        }
         _remote_sink = sink;
         if (_remote_video_track && _remote_sink) {
             _remote_video_track->AddOrUpdateSink(_remote_sink, webrtc::VideoSinkWants());
@@ -300,7 +385,7 @@ void WebRTCMgr::OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnec
     case webrtc::PeerConnectionInterface::kIceConnectionDisconnected:
     case webrtc::PeerConnectionInterface::kIceConnectionFailed:
     case webrtc::PeerConnectionInterface::kIceConnectionClosed:
-        HangUp();
+        QMetaObject::invokeMethod(this, [this]() { HangUp(); }, Qt::QueuedConnection);
         break;
     default:
         break;
@@ -308,27 +393,38 @@ void WebRTCMgr::OnIceConnectionChange(webrtc::PeerConnectionInterface::IceConnec
 }
 
 void WebRTCMgr::HangUp() {
-    RunOnSignalingThread([this]() {
-        if (_peer_connection) {
-            _peer_connection->Close();
-            _peer_connection = nullptr;
-        }
-
-        _target_uid = 0;
-        _remote_sink = nullptr;
-        _remote_video_track = nullptr;
-        local_audio_track_ = nullptr;
-
-        QMetaObject::invokeMethod(this, [this]() { emit sig_callEnded(); }, Qt::QueuedConnection);
-    });
+    auto call_mgr = CallSessionMgr::GetInstance();
+    if (call_mgr->GetState() != CallSessionMgr::CallState::Idle &&
+        !call_mgr->IsTerminal()) {
+        call_mgr->MarkEnded();
+    }
+    CleanupCallResources();
 }
 
 void WebRTCMgr::RejectOrHangUp() {
+    auto call_mgr = CallSessionMgr::GetInstance();
+    if (call_mgr->GetState() == CallSessionMgr::CallState::Ringing &&
+        call_mgr->GetDirection() == CallSessionMgr::CallDirection::Incoming) {
+        call_mgr->MarkRejected();
+    } else if (call_mgr->GetState() != CallSessionMgr::CallState::Idle &&
+               !call_mgr->IsTerminal()) {
+        call_mgr->MarkEnded();
+    }
+
     QJsonObject p;
     SendSignalingMessage("webrtc_hangup", p);
-    HangUp();
+    CleanupCallResources();
 }
 
-void WebRTCMgr::HandleRemoteHangUp(int /*fromUid*/) {
-    HangUp();
+void WebRTCMgr::HandleRemoteHangUp(int fromUid) {
+    auto call_mgr = CallSessionMgr::GetInstance();
+    if (call_mgr->GetState() == CallSessionMgr::CallState::Ringing &&
+        call_mgr->GetDirection() == CallSessionMgr::CallDirection::Outgoing &&
+        (call_mgr->GetPeerUid() == 0 || call_mgr->GetPeerUid() == fromUid)) {
+        call_mgr->MarkRejected();
+    } else if (call_mgr->GetState() != CallSessionMgr::CallState::Idle &&
+               !call_mgr->IsTerminal()) {
+        call_mgr->MarkEnded();
+    }
+    CleanupCallResources();
 }

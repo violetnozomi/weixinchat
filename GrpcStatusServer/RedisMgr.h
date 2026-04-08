@@ -44,6 +44,7 @@ public:
     std::string HGet(const std::string &key, const std::string &hkey);
     bool Del(const std::string &key);
     bool ExistsKey(const std::string &key);
+    bool Expire(const std::string &key, int seconds);
     void Close();
 private:
     RedisMgr();

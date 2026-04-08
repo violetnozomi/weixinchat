@@ -1,6 +1,7 @@
 #include "mainwindow.h"
 #include "ui_mainwindow.h"
 #include "chatdialog.h"
+#include "ChatMgr.h"
 #include<QVBoxLayout>
 #include<QLabel>
 #include<qtimer.h>
@@ -117,19 +118,16 @@ void MainWindow::handle_ForGetPwd(){
 void MainWindow::slot_switch_chatdlg()
 {
     qDebug() << "Authentication successful! Switching to chat dialog...";
-    
-    // TODO: 从TcpMgr获取用户信息并设置到chatDialog
-    // auto tcpMgr = TcpMgr::GetInstance();
-    // _chat_dialog->SetUserInfo(tcpMgr->GetUid(), tcpMgr->GetUser(), tcpMgr->GetToken());
-    
-    // TODO: 从服务器加载好友列表
-    // 现在使用chatDialog内置的测试数据
-    
+
+    // 初始化 ChatMgr（打开本地 SQLite，加载消息历史）
+    int uid = TcpMgr::GetInstance()->GetUid();
+    ChatMgr::GetInstance()->Init(uid);
+
     // 隐藏主窗口，显示独立的聊天窗口
     this->hide();
     _chat_dialog->show();
-    _chat_dialog->raise();  // 确保窗口在最前面
-    _chat_dialog->activateWindow();  // 激活窗口
+    _chat_dialog->raise();
+    _chat_dialog->activateWindow();
 }
 void MainWindow::handle_Cancel_ForGetPwd()
 {

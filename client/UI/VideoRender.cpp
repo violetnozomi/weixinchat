@@ -12,6 +12,9 @@ public:
 
     // WebRTC 后台线程会不断调用这个函数
     void OnFrame(const webrtc::VideoFrame& frame)  {
+        // Safety guard: widget may be destroying on main thread
+        if (render_->_stopped.load(std::memory_order_acquire)) return;
+
         webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer = frame.video_frame_buffer();
 
         webrtc::scoped_refptr<webrtc::I420BufferInterface> i420_buffer = buffer->ToI420();
@@ -56,6 +59,8 @@ VideoRender::VideoRender(QWidget *parent)
 
 VideoRender::~VideoRender()
 {
+    // Signal OnFrame to stop before sink_ and this widget are torn down
+    _stopped.store(true, std::memory_order_release);
 }
 
 webrtc::VideoSinkInterface<webrtc::VideoFrame>* VideoRender::GetVideoSink()
